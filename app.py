@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from flask import Flask, request, jsonify
 
-VERSION = "4.0.0"
+VERSION = "4.0.1"
 ENGINE_NAME = "Gold Analysis Engine"
 SYMBOL = "XAU/USD"
 TIMEFRAMES = ["15min", "1h", "4h", "1day", "1week", "1month"]
@@ -56,26 +56,61 @@ def _finite_number(value: Any, field: str) -> float:
     return number
 
 
+def _extract_candle_array(value: Any) -> Optional[List[dict]]:
+    """Accept a timeframe as a candle array or a common n8n wrapper object."""
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        # Common shapes: {"candles": [...]}, {"data": [...]}, {"items": [...]}
+        for key in ("candles", "data", "items", "records", "values"):
+            candidate = value.get(key)
+            if isinstance(candidate, list):
+                return candidate
+        # Some nodes wrap the timeframe one level deeper.
+        for key in ("result", "output", "body"):
+            nested = value.get(key)
+            if isinstance(nested, dict):
+                extracted = _extract_candle_array(nested)
+                if extracted is not None:
+                    return extracted
+    return None
+
+
 def normalize_payload(payload: Any) -> Tuple[Dict[str, List[dict]], List[str]]:
     errors: List[str] = []
     if not isinstance(payload, dict):
         return {}, ["payload_must_be_object"]
+
+    # Accept either {"timeframes": {...}} or the timeframe keys at the root.
     raw_frames = payload.get("timeframes", payload)
     if not isinstance(raw_frames, dict):
         return {}, ["timeframes_must_be_object"]
+
+    # Also accept a common n8n wrapper: {"data": {"timeframes": {...}}}.
+    if not any(tf in raw_frames for tf in TIMEFRAMES):
+        for wrapper_key in ("data", "body", "result", "output"):
+            nested = raw_frames.get(wrapper_key)
+            if isinstance(nested, dict):
+                candidate = nested.get("timeframes", nested)
+                if isinstance(candidate, dict) and any(tf in candidate for tf in TIMEFRAMES):
+                    raw_frames = candidate
+                    break
+
     normalized: Dict[str, List[dict]] = {}
     for tf in TIMEFRAMES:
-        rows = raw_frames.get(tf)
-        if rows is None:
+        raw_value = raw_frames.get(tf)
+        if raw_value is None:
             errors.append(f"{tf}:missing_timeframe")
             continue
-        if not isinstance(rows, list):
-            errors.append(f"{tf}:candles_must_be_array")
+        rows = _extract_candle_array(raw_value)
+        if rows is None:
+            errors.append(f"{tf}:candles_must_be_array_or_wrapped_array")
             continue
         if len(rows) > MAX_CANDLES:
             rows = rows[-MAX_CANDLES:]
-        parsed = []
-        row_errors = []
+
+        parsed: List[dict] = []
+        row_errors: List[str] = []
         for idx, row in enumerate(rows):
             if not isinstance(row, dict):
                 row_errors.append(f"{tf}[{idx}]:candle_must_be_object")
@@ -103,9 +138,10 @@ def normalize_payload(payload: Any) -> Tuple[Dict[str, List[dict]], List[str]]:
                                "low": l, "close": c, "volume": vol, "is_incomplete": incomplete})
             except Exception as exc:
                 row_errors.append(f"{tf}[{idx}]:{str(exc)}")
+
         # Sort by UTC instant; duplicate instants are rejected rather than silently merged.
         parsed.sort(key=lambda x: x["_ts"])
-        unique = []
+        unique: List[dict] = []
         seen = set()
         for candle in parsed:
             key = candle["_ts"]
@@ -375,4 +411,3 @@ def analyze_endpoint():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
-        
