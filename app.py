@@ -8,7 +8,7 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-VERSION = "3.0.0"
+VERSION = "3.1.0"
 ENGINE_NAME = "Gold Analysis Engine"
 SYMBOL = "XAU/USD"
 
@@ -196,11 +196,14 @@ def validate_timeframe(tf: str, section: Any) -> dict:
         return result
 
     original_keys = [dt_key(x["datetime"]) for x in parsed]
-    result["out_of_order"] = any(
-        original_keys[i] <= original_keys[i - 1] for i in range(1, len(original_keys))
-    )
-    if result["out_of_order"]:
-        result["warnings"].append("ترتيب الشموع الواردة غير تصاعدي؛ تم ترتيب النسخة الداخلية زمنيًا بعد كشف المشكلة.")
+    ascending = all(original_keys[i] > original_keys[i - 1] for i in range(1, len(original_keys)))
+    descending = all(original_keys[i] < original_keys[i - 1] for i in range(1, len(original_keys)))
+    result["out_of_order"] = not ascending
+    result["input_order"] = "ASCENDING" if ascending else ("DESCENDING" if descending else "MIXED")
+    if descending:
+        result["warnings"].append("الشموع واردة من الأحدث إلى الأقدم؛ تم عكسها داخليًا بالترتيب الزمني الصحيح.")
+    elif not ascending:
+        result["errors"].append("ترتيب الشموع مختلط وغير متتابع؛ أرسلها بترتيب زمني ثابت لتجنب تحليل بيانات مشوشة.")
 
     parsed.sort(key=lambda x: dt_key(x["datetime"]))
     complete = [x for x in parsed if not x["is_incomplete"]]
@@ -402,14 +405,52 @@ def cluster_levels(levels: List[dict], tolerance: float) -> List[dict]:
 
 
 def collect_levels(tf_data: dict, side: str) -> List[dict]:
+    """Collect confirmed swing levels plus explicit, rule-defined FVG/OB references."""
     found = []
     for tf in TIMEFRAMES:
         candles = tf_data[tf]["candles"]
         for p in pivots(candles, side):
             found.append({
                 "price": p["price"], "index": p["index"],
-                "datetime": p["datetime"], "timeframe": tf, "source": "SWING_HIGH" if side == "high" else "SWING_LOW",
+                "datetime": p["datetime"], "timeframe": tf,
+                "source": "SWING_HIGH" if side == "high" else "SWING_LOW",
             })
+        local_atr = atr(candles)
+        min_gap = max(local_atr * 0.05, 0.10)
+        # Three-candle fair-value gaps. Only completed candles are supplied here.
+        for i in range(2, len(candles)):
+            a, c = candles[i - 2], candles[i]
+            if side == "high" and a["low"] - c["high"] >= min_gap:
+                found.append({
+                    "price": (a["low"] + c["high"]) / 2, "index": i,
+                    "datetime": c["datetime"].isoformat(), "timeframe": tf,
+                    "source": "FVG_BEARISH",
+                })
+            elif side == "low" and c["low"] - a["high"] >= min_gap:
+                found.append({
+                    "price": (c["low"] + a["high"]) / 2, "index": i,
+                    "datetime": c["datetime"].isoformat(), "timeframe": tf,
+                    "source": "FVG_BULLISH",
+                })
+        # Basic displacement order block: last opposite candle before a >=0.9 ATR break.
+        body_threshold = max(local_atr * 0.9, 0.10)
+        for i in range(1, len(candles)):
+            prev, cur = candles[i - 1], candles[i]
+            body = abs(cur["close"] - cur["open"])
+            if side == "high":
+                valid_ob = (prev["close"] > prev["open"] and cur["close"] < cur["open"]
+                            and cur["close"] < prev["low"] and body >= body_threshold)
+                source = "ORDER_BLOCK_BEARISH"
+            else:
+                valid_ob = (prev["close"] < prev["open"] and cur["close"] > cur["open"]
+                            and cur["close"] > prev["high"] and body >= body_threshold)
+                source = "ORDER_BLOCK_BULLISH"
+            if valid_ob:
+                found.append({
+                    "price": (prev["open"] + prev["close"]) / 2, "index": i - 1,
+                    "datetime": prev["datetime"].isoformat(), "timeframe": tf,
+                    "source": source,
+                })
     return found
 
 
@@ -448,12 +489,13 @@ def build_zones(tf_data: dict, current: float, side: str, base_atr: float) -> Li
         rejection = 0
         for tf in cluster["timeframes"]:
             rejection = max(rejection, rejection_score(tf_data[tf]["candles"], level, side, tolerance))
-        score = 25 + min(cluster["touches"] * 7, 21) + min(len(cluster["timeframes"]) * 9, 27) + rejection
-        # Recency is a modest bonus, not a probability.
+        pattern_sources = sum(1 for x in cluster["source_types"] if x.startswith(("FVG_", "ORDER_BLOCK_")))
+        score = 10 + min(cluster["touches"] * 8, 32) + min(len(cluster["timeframes"]) * 12, 36) + min(pattern_sources * 4, 12) + rejection
+        # A strong label requires independent multi-timeframe evidence, not a single pivot.
         score = int(clamp(score, 0, 95))
-        if score >= 70:
+        if score >= 70 and len(cluster["timeframes"]) >= 2 and cluster["touches"] >= 2:
             strength = "STRONG_CONFLUENCE"
-        elif score >= 52:
+        elif score >= 50 and (len(cluster["timeframes"]) >= 2 or cluster["touches"] >= 3):
             strength = "MODERATE_CONFLUENCE"
         else:
             strength = "LIMITED_CONFLUENCE"
@@ -462,15 +504,16 @@ def build_zones(tf_data: dict, current: float, side: str, base_atr: float) -> Li
         if side == "SELL":
             stop = high + risk_buffer
             risk = stop - level
-            raw_targets = [current - base_atr * r for r in (0.8, 1.3, 2.0, 3.0)]
-            targets = [x for x in raw_targets if x < current]
+            # Zone-specific targets: calculated from this zone's own risk, not current-price ATR.
+            raw_targets = [level - risk * rr for rr in (1.0, 1.5, 2.0, 3.0)]
+            targets = [x for x in raw_targets if x < level]
             targets = sorted(set(targets), reverse=True)[:4]
             invalidation = round_price(high + risk_buffer)
         else:
             stop = low - risk_buffer
             risk = level - stop
-            raw_targets = [current + base_atr * r for r in (0.8, 1.3, 2.0, 3.0)]
-            targets = sorted(set(raw_targets))[:4]
+            raw_targets = [level + risk * rr for rr in (1.0, 1.5, 2.0, 3.0)]
+            targets = sorted(set(x for x in raw_targets if x > level))[:4]
             invalidation = round_price(low - risk_buffer)
 
         if risk <= 0:
@@ -486,9 +529,12 @@ def build_zones(tf_data: dict, current: float, side: str, base_atr: float) -> Li
             "touches": cluster["touches"],
             "timeframes": cluster["timeframes"],
             "sources": cluster["source_types"],
+            "evidence_quality": "تلاقي متعدد الفريمات/اللمسات" if strength == "STRONG_CONFLUENCE" else "أدلة محدودة أو متوسطة؛ لا تُعامل كمنطقة دفاع مؤكدة",
+            "method_note": "المصادر المعروضة هي Swing أو FVG ثلاثي الشموع أو Order Block أساسي بعد شمعة اندفاع وكسر؛ التعريفات آلية ومبسطة وليست ضمانًا مؤسسيًا.",
             "stop_loss": round_price(stop),
             "risk_distance": round_price(risk),
             "targets": {f"tp{i+1}": round_price(v) for i, v in enumerate(targets)},
+            "target_method": "مستويات مستقلة لكل منطقة محسوبة من مخاطرة المنطقة نفسها (1R/1.5R/2R/3R)، وليست إسقاط ATR موحدًا من السعر الحالي.",
             "confirmation": (
                 "انتظر وصول السعر للمنطقة ثم رفضًا هابطًا وإغلاق 15min أسفل قاع شمعة الرفض."
                 if side == "SELL" else
@@ -550,7 +596,7 @@ def structure_summary(tf_data: dict) -> dict:
 
 
 def make_scenario(side: str, zones: List[dict], current: float, trend_data: dict) -> dict:
-    nearest = zones[:5]
+    nearest = zones[:12]
     if not nearest:
         return {
             "direction": side, "status": "NO_VALID_ZONE",
@@ -580,6 +626,28 @@ def make_scenario(side: str, zones: List[dict], current: float, trend_data: dict
     }
 
 
+def cross_timeframe_price_check(tf_data: dict) -> dict:
+    """Flag large close discrepancies; different candle close times are expected."""
+    fast = tf_data["15min"]["candles"][-1]["close"]
+    fast_atr = max(atr(tf_data["15min"]["candles"]), 0.01)
+    checks = []
+    warnings = []
+    for tf in TIMEFRAMES:
+        close = tf_data[tf]["candles"][-1]["close"]
+        diff = abs(close - fast)
+        allowance = max(3.0 * fast_atr, 2.0 * atr(tf_data[tf]["candles"]), fast * 0.003)
+        suspicious = tf != "15min" and diff > allowance
+        checks.append({
+            "timeframe": tf, "latest_close": round_price(close),
+            "difference_from_15min": round_price(diff),
+            "review_threshold": round_price(allowance),
+            "suspicious_difference": suspicious,
+        })
+        if suspicious:
+            warnings.append(f"إغلاق {tf} بعيد بشكل غير معتاد عن 15min؛ راجع تزامن البيانات أو مصدر السعر.")
+    return {"status": "REVIEW_REQUIRED" if warnings else "CONSISTENT_ENOUGH", "checks": checks, "warnings": warnings}
+
+
 def analyze_market(tf_data: dict, validation: dict) -> dict:
     base = tf_data["15min"]["candles"]
     current = base[-1]["close"]
@@ -593,6 +661,7 @@ def analyze_market(tf_data: dict, validation: dict) -> dict:
     sell = make_scenario("SELL", sell_zones, current, trends)
     buy = make_scenario("BUY", buy_zones, current, trends)
     liquidity = liquidity_map(tf_data, current, base_atr)
+    consistency = cross_timeframe_price_check(tf_data)
 
     if sell.get("confluence_score", 0) > buy.get("confluence_score", 0):
         leading = "SELL"
@@ -620,10 +689,17 @@ def analyze_market(tf_data: dict, validation: dict) -> dict:
             "if_price_falls": buy,
         },
         "nearest_strong_levels": {
-            "sell_zone_within_3_atr": nearest_sell,
-            "buy_zone_within_3_atr": nearest_buy,
-            "note": "إذا كانت القيمة null فلا توجد منطقة ضمن 3 ATR؛ راجع المناطق الأبعد في السيناريو.",
+            "sell_zone_within_3_atr": next((z for z in sell_zones if z["distance_from_current"] <= near_limit and z["strength"] == "STRONG_CONFLUENCE"), None),
+            "buy_zone_within_3_atr": next((z for z in buy_zones if z["distance_from_current"] <= near_limit and z["strength"] == "STRONG_CONFLUENCE"), None),
+            "note": "هذا القسم يعرض المناطق التي اجتازت شروط القوة فقط. المناطق الأضعف تظهر منفصلة في السيناريوهات ولا تُسمى قوية.",
         },
+        "all_zones_summary": {
+            "sell_strong_count": sum(z["strength"] == "STRONG_CONFLUENCE" for z in sell_zones),
+            "buy_strong_count": sum(z["strength"] == "STRONG_CONFLUENCE" for z in buy_zones),
+            "sell_zones_count": len(sell_zones), "buy_zones_count": len(buy_zones),
+            "note": "قد لا توجد منطقة قوية حاليًا؛ لا يتم رفع تصنيف منطقة ضعيفة لإجبار المحرك على إعطاء إشارة."
+        },
+        "cross_timeframe_price_check": consistency,
         "hidden_liquidity": liquidity,
         "volatility": {
             "atr_15min": round_price(base_atr),
@@ -640,6 +716,8 @@ def analyze_market(tf_data: dict, validation: dict) -> dict:
             "درجة التلاقي ليست احتمال نجاح ولا نسبة ربح.",
             "المناطق الفنية قد تُخترق؛ لا توجد منطقة مضمونة الانعكاس.",
             "البيانات المحدودة إلى 30 شمعة لكل فريم تقلل دقة البنية التاريخية.",
+            "تعريفات FVG وOrder Block آلية ومبسطة؛ راجع تكوين كل نموذج قبل الاعتماد عليه.",
+            "اختلاف إغلاقات الفريمات الكبيرة قد يكون بسبب توقيت الإغلاق، لكن الاختلاف الكبير يُعلّم للمراجعة ولا يُعامل كحقيقة متزامنة.",
         ],
     }
 
@@ -654,6 +732,7 @@ def home():
         "symbol": SYMBOL,
         "status": "online",
         "endpoint": "POST /analyze",
+        "features": ["Strict OHLC validation", "Descending candle-order support", "Ranked BUY/SELL swing reaction zones", "Per-zone risk-based targets", "Liquidity pools", "Cross-timeframe price consistency checks"],
     })
 
 
