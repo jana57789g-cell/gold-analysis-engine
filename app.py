@@ -7,7 +7,7 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 ENGINE_NAME = "Gold Analysis Engine"
 SYMBOL = "XAU/USD"
 
@@ -26,6 +26,7 @@ ATR_PERIOD = 14
 PRICE_EPSILON = 1e-9
 MAX_ZONE_AGE_CANDLES = 80
 MAX_RETURNED_ZONES = 5
+MAX_DIRECTION_ZONES = 3
 
 
 # ============================================================
@@ -597,6 +598,110 @@ def build_zone_plan(zone, direction, price, atr, tf_result):
     }
 
 
+def collect_projection_levels(results, direction, current_price):
+    """Collect nearby liquidity/pivot levels in the requested travel direction."""
+    downward = direction == "SELL"
+    candidates = []
+    for tf in TIMEFRAMES:
+        data = results.get(tf, {})
+        if data.get("status") != "analyzed":
+            continue
+        liquidity_key = "equal_lows" if downward else "equal_highs"
+        for item in data.get("liquidity", {}).get(liquidity_key, []):
+            level = item.get("level")
+            if isinstance(level, (int, float)) and ((level < current_price) if downward else (level > current_price)):
+                candidates.append({"price": float(level), "timeframe": tf, "source": "EQUAL_LOWS" if downward else "EQUAL_HIGHS"})
+        pivot_key = "swing_lows" if downward else "swing_highs"
+        for item in data.get(pivot_key, []):
+            level = item.get("price")
+            if isinstance(level, (int, float)) and ((level < current_price) if downward else (level > current_price)):
+                candidates.append({"price": float(level), "timeframe": tf, "source": "SWING_LOW" if downward else "SWING_HIGH"})
+
+    # Merge near-identical levels while preserving their independent timeframe/source evidence.
+    candidates.sort(key=lambda x: abs(x["price"] - current_price))
+    merged = []
+    for item in candidates:
+        existing = next((x for x in merged if abs(x["price"] - item["price"]) <= max(0.01, current_price * 0.00005)), None)
+        if existing:
+            if item["timeframe"] not in existing["timeframes"]:
+                existing["timeframes"].append(item["timeframe"])
+            if item["source"] not in existing["sources"]:
+                existing["sources"].append(item["source"])
+        else:
+            merged.append({
+                "price": item["price"],
+                "timeframes": [item["timeframe"]],
+                "sources": [item["source"]],
+                "distance": abs(item["price"] - current_price)
+            })
+    return merged[:5]
+
+
+def build_price_projection(results, direction_candidates, overall):
+    """Scenario map from the latest close; not a deterministic price prediction."""
+    fast = results.get("15min", {})
+    if fast.get("status") != "analyzed":
+        return {"status": "UNAVAILABLE", "reason": "15min data is unavailable"}
+
+    price = float(fast["latest_close"])
+    atr = float(fast.get("atr", 0) or 0)
+    by_direction = {x["direction"]: x for x in direction_candidates}
+    scenarios = {}
+
+    for direction in ("SELL", "BUY"):
+        candidate = by_direction.get(direction, {})
+        levels = collect_projection_levels(results, direction, price)
+        confirmation_pivots = fast.get("swing_lows" if direction == "SELL" else "swing_highs", [])
+        invalidation_pivots = fast.get("swing_highs" if direction == "SELL" else "swing_lows", [])
+        confirmation_level = confirmation_pivots[-1].get("price") if confirmation_pivots else None
+        invalidation_level = invalidation_pivots[-1].get("price") if invalidation_pivots else None
+        scenarios[direction.lower()] = {
+            "direction": direction,
+            "confluence_score": candidate.get("base_score", 0),
+            "score_is_probability": False,
+            "path_targets": levels,
+            "confirmation_level": confirmation_level,
+            "invalidation_level": invalidation_level,
+            "confirmation_rule": (
+                "15min candle close below the latest confirmed swing low"
+                if direction == "SELL" else
+                "15min candle close above the latest confirmed swing high"
+            ),
+            "invalidation_rule": (
+                "15min close above the latest confirmed swing high and bearish structure failure"
+                if direction == "SELL" else
+                "15min close below the latest confirmed swing low and bullish structure failure"
+            )
+        }
+
+    best = max(direction_candidates, key=lambda x: x.get("base_score", 0)) if direction_candidates else {}
+    chosen = best.get("direction")
+    reliable = bool(fast.get("timestamp_reliable", False))
+    return {
+        "status": "SCENARIO_MAP" if reliable else "DATA_TIME_UNVERIFIED",
+        "current_price": price,
+        "as_of": fast.get("latest_datetime"),
+        "timestamp_basis": fast.get("timestamp_basis", "unknown"),
+        "timestamp_reliable": reliable,
+        "leading_direction": chosen,
+        "leading_scenario": scenarios.get(chosen.lower()) if chosen else None,
+        "scenarios": scenarios,
+        "reference_range": {
+            "lower_1_atr": price - atr,
+            "upper_1_atr": price + atr,
+            "atr_15min": atr,
+            "note": "Volatility reference only; not a forecast or guaranteed range"
+        },
+        "warning": (
+            "Scenario levels are conditional technical references, not a promise of where price will go. "
+            "Validate with historical out-of-sample and walk-forward tests."
+        ) if reliable else (
+            "Timestamp is not verified/timezone-aware. Treat this projection as provisional until "
+            "the candle timezone and latest-candle freshness are fixed."
+        )
+    }
+
+
 def build_entry_setup(results, overall):
     fast = results.get("15min", {})
     hourly = results.get("1h", {})
@@ -638,8 +743,7 @@ def build_entry_setup(results, overall):
 
         event = latest_signal_event(fast)
         if event and event.get("direction") == wanted and event.get("event") in ("BOS", "CHoCH"):
-            # Event must be recent on the 15m sample.
-            age = len(fast.get("swing_highs", [])) * 0 + fast.get("complete", 0) - 1 - event.get("break_candle_index", 0)
+            age = fast.get("complete", 0) - 1 - event.get("break_candle_index", 0)
             if age <= 8:
                 score += 15
                 reasons.append("Recent 15min close-confirmed BOS/CHoCH agrees")
@@ -669,11 +773,8 @@ def build_entry_setup(results, overall):
                 "within_entry_distance": distance <= atr * MAX_ENTRY_DISTANCE_ATR
             })
 
-        ranked.sort(key=lambda z: (z["zone_score"], -z["plan"]["distance_from_current_price"]),
-                    reverse=True)
-
-        best_zone = ranked[0] if ranked else None
-        if best_zone:
+        ranked.sort(key=lambda z: (z["zone_score"], -z["plan"]["distance_from_current_price"]), reverse=True)
+        if ranked:
             score += 10
             reasons.append("At least one active, unmitigated 15min reaction zone exists")
 
@@ -687,23 +788,6 @@ def build_entry_setup(results, overall):
     direction = chosen["direction"]
     score = chosen["base_score"]
     zones = chosen["zones"]
-
-    if score < MIN_SETUP_SCORE or not zones:
-        return {
-            "status": "WAIT", "score": score, "score_is_probability": False,
-            "best_candidate": direction,
-            "reason": "No direction currently meets the confluence and valid-zone requirements",
-            "reasons": chosen["reasons"],
-            "alternative_direction_score": direction_candidates[1]["base_score"]
-        }
-
-    eligible = [z for z in zones if z["within_entry_distance"]]
-    # Main zone is the strongest valid zone, even if it is farther away.
-    main = zones[0]
-    # Alternative is the nearest other strong zone that is currently within distance.
-    alternatives = [z for z in eligible if z is not main and z["zone_score"] >= 55]
-    alternatives.sort(key=lambda z: z["plan"]["distance_from_current_price"])
-    backup = alternatives[0] if alternatives else None
 
     def public_zone(z, role):
         if not z:
@@ -720,8 +804,43 @@ def build_entry_setup(results, overall):
             **z["plan"]
         }
 
+    ranked_by_direction = {}
+    for candidate in direction_candidates:
+        ranked_by_direction[candidate["direction"].lower()] = [
+            public_zone(z, "RANK_" + str(i + 1))
+            for i, z in enumerate(candidate["zones"][:MAX_DIRECTION_ZONES])
+        ]
+
+    projection = build_price_projection(results, direction_candidates, overall)
+    if score < MIN_SETUP_SCORE or not zones:
+        main = public_zone(zones[0], "PRIMARY") if zones else None
+        early_alternatives = [z for z in zones[1:] if z["zone_score"] >= 35]
+        early_alternatives.sort(key=lambda z: z["plan"]["distance_from_current_price"])
+        early_backup = public_zone(early_alternatives[0], "NEAREST_ALTERNATIVE") if early_alternatives else None
+        return {
+            "status": "WAIT", "score": score, "score_is_probability": False,
+            "best_candidate": direction,
+            "direction": direction,
+            "reason": ("No valid reaction zone is available" if not zones else
+                       "Direction score is below the setup threshold"),
+            "reasons": chosen["reasons"],
+            "alternative_direction_score": direction_candidates[1]["base_score"],
+            "current_price": price,
+            "primary_zone": main,
+            "nearest_alternative_zone": early_backup,
+            "additional_zones": [public_zone(z, "ADDITIONAL") for z in zones[1:MAX_RETURNED_ZONES]
+                                 if not early_alternatives or z is not early_alternatives[0]],
+            "ranked_zones_by_direction": ranked_by_direction,
+            "price_projection": projection,
+            "warning": "Scores are heuristic confluence scores, not probabilities. No zone or projection is guaranteed."
+        }
+
+    main = zones[0]
+    alternatives = [z for z in zones[1:] if z["zone_score"] >= 35]
+    alternatives.sort(key=lambda z: z["plan"]["distance_from_current_price"])
+    backup = alternatives[0] if alternatives else None
     main_public = public_zone(main, "PRIMARY")
-    backup_public = public_zone(backup, "NEAREST_QUALIFIED_ALTERNATIVE")
+    backup_public = public_zone(backup, "NEAREST_ALTERNATIVE")
     extra = [public_zone(z, "ADDITIONAL") for z in zones[1:MAX_RETURNED_ZONES]
              if z is not backup]
 
@@ -743,7 +862,8 @@ def build_entry_setup(results, overall):
         "primary_zone": main_public,
         "nearest_alternative_zone": backup_public,
         "additional_zones": extra,
-        # Backward-compatible fields used by the previous output consumer.
+        "ranked_zones_by_direction": ranked_by_direction,
+        "price_projection": projection,
         "entry_zone": main_public["entry_zone"],
         "entry_reference": main_public["entry_reference"],
         "stop_loss": main_public["stop_loss"],
@@ -811,7 +931,9 @@ def home():
             "Fair Value Gaps", "Duplicate-Suppressed Basic Order Blocks",
             "Premium/Discount", "Multi-Timeframe Analysis",
             "Ranked Reaction Zones", "Primary and Nearest Alternative Zones",
-            "Risk/Reward Levels", "Potential Liquidity Targets"
+            "Risk/Reward Levels", "Potential Liquidity Targets",
+            "Top 3 Buy/Sell Reaction Zones", "Conditional Price-Path Scenarios",
+            "Liquidity-Based Projection Levels", "Timestamp Reliability Checks"
         ]
     })
 
