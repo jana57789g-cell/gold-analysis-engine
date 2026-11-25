@@ -7,26 +7,25 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 ENGINE_NAME = "Gold Analysis Engine"
 SYMBOL = "XAU/USD"
 
 TIMEFRAMES = ["15min", "1h", "4h", "1day", "1week", "1month"]
 MIN_COMPLETE_CANDLES = 10
 
-# Pivot settings. These are rule parameters, not universal market truths.
 SWING_LEFT = 2
 SWING_RIGHT = 2
 INTERNAL_LEFT = 1
 INTERNAL_RIGHT = 1
 
-# Signal settings. Tune only through out-of-sample testing.
 MIN_SETUP_SCORE = 70
-MIN_RISK_REWARD = 1.5
 MAX_ENTRY_DISTANCE_ATR = 1.5
 EQUAL_LEVEL_ATR_FRACTION = 0.10
 ATR_PERIOD = 14
 PRICE_EPSILON = 1e-9
+MAX_ZONE_AGE_CANDLES = 80
+MAX_RETURNED_ZONES = 5
 
 
 # ============================================================
@@ -46,11 +45,8 @@ def parse_time(value):
 
 
 def same_price(a: float, b: float) -> bool:
-    return math.isclose(
-        float(a), float(b),
-        rel_tol=PRICE_EPSILON,
-        abs_tol=PRICE_EPSILON
-    )
+    return math.isclose(float(a), float(b), rel_tol=PRICE_EPSILON,
+                        abs_tol=PRICE_EPSILON)
 
 
 def validate_candle(raw: Any) -> Optional[Dict[str, Any]]:
@@ -62,10 +58,8 @@ def validate_candle(raw: Any) -> Optional[Dict[str, Any]]:
             return None
         if values["low"] > values["high"]:
             return None
-        if not (
-            values["low"] <= values["open"] <= values["high"]
-            and values["low"] <= values["close"] <= values["high"]
-        ):
+        if not (values["low"] <= values["open"] <= values["high"]
+                and values["low"] <= values["close"] <= values["high"]):
             return None
         timestamp = raw.get("datetime")
         if parse_time(timestamp) is None:
@@ -113,6 +107,8 @@ def normalize_candles(section: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Di
         "complete": len(ordered),
         "timestamp_timezone_aware": bool(aware and all(aware)),
         "timestamp_basis": section.get("timestamp_basis", "unknown"),
+        "timestamp_reliable": bool(aware and all(aware)
+                                   and section.get("timestamp_basis") not in (None, "", "unknown"))
     }
     return ordered, meta
 
@@ -126,11 +122,9 @@ def calculate_atr(candles: List[Dict[str, Any]], period: int = ATR_PERIOD) -> fl
             tr = c["high"] - c["low"]
         else:
             prev_close = candles[i - 1]["close"]
-            tr = max(
-                c["high"] - c["low"],
-                abs(c["high"] - prev_close),
-                abs(c["low"] - prev_close)
-            )
+            tr = max(c["high"] - c["low"],
+                     abs(c["high"] - prev_close),
+                     abs(c["low"] - prev_close))
         trs.append(max(0.0, tr))
     sample = trs[-period:]
     return sum(sample) / len(sample) if sample else 0.0
@@ -148,51 +142,29 @@ def find_pivots(candles, left=2, right=2):
     for i in range(left, len(candles) - right):
         current = candles[i]
         neighbors = candles[i-left:i] + candles[i+1:i+right+1]
-
         if all(current["high"] > c["high"] for c in neighbors):
-            highs.append({
-                "index": i,
-                "price": current["high"],
-                "datetime": current["datetime"],
-                "confirmed_at_index": i + right
-            })
-
+            highs.append({"index": i, "price": current["high"],
+                          "datetime": current["datetime"],
+                          "confirmed_at_index": i + right})
         if all(current["low"] < c["low"] for c in neighbors):
-            lows.append({
-                "index": i,
-                "price": current["low"],
-                "datetime": current["datetime"],
-                "confirmed_at_index": i + right
-            })
+            lows.append({"index": i, "price": current["low"],
+                         "datetime": current["datetime"],
+                         "confirmed_at_index": i + right})
     return highs, lows
 
 
 def classify_structure(highs, lows):
     if len(highs) < 2 or len(lows) < 2:
-        return {
-            "trend": "UNCONFIRMED",
-            "structure": [],
-            "high_type": None,
-            "low_type": None,
-            "reason": "At least two confirmed swing highs and lows are required"
-        }
+        return {"trend": "UNCONFIRMED", "structure": [],
+                "high_type": None, "low_type": None,
+                "reason": "At least two confirmed swing highs and lows are required"}
 
     h1, h2 = highs[-2], highs[-1]
     l1, l2 = lows[-2], lows[-1]
-
-    if same_price(h1["price"], h2["price"]):
-        high_type = "EQH"
-    elif h2["price"] > h1["price"]:
-        high_type = "HH"
-    else:
-        high_type = "LH"
-
-    if same_price(l1["price"], l2["price"]):
-        low_type = "EQL"
-    elif l2["price"] > l1["price"]:
-        low_type = "HL"
-    else:
-        low_type = "LL"
+    high_type = "EQH" if same_price(h1["price"], h2["price"]) else (
+        "HH" if h2["price"] > h1["price"] else "LH")
+    low_type = "EQL" if same_price(l1["price"], l2["price"]) else (
+        "HL" if l2["price"] > l1["price"] else "LL")
 
     if high_type == "HH" and low_type == "HL":
         trend = "BULLISH"
@@ -205,13 +177,9 @@ def classify_structure(highs, lows):
         {"type": high_type, "price": h2["price"], "datetime": h2["datetime"], "index": h2["index"]},
         {"type": low_type, "price": l2["price"], "datetime": l2["datetime"], "index": l2["index"]}
     ]
-    return {
-        "trend": trend,
-        "structure": structure,
-        "high_type": high_type,
-        "low_type": low_type,
-        "reason": "Based on the two latest confirmed swing highs and lows"
-    }
+    return {"trend": trend, "structure": structure, "high_type": high_type,
+            "low_type": low_type,
+            "reason": "Based on the two latest confirmed swing highs and lows"}
 
 
 def trend_at_index(highs, lows, index):
@@ -221,78 +189,49 @@ def trend_at_index(highs, lows, index):
 
 
 def detect_structure_events(candles, highs, lows):
-    """
-    Historical, close-confirmed break detection.
-    A pivot is eligible only after its right-side confirmation candles have closed.
-    Each pivot level can trigger at most one event.
-    """
     events = []
     broken_highs, broken_lows = set(), set()
-
     for i in range(1, len(candles)):
-        prev_close = candles[i - 1]["close"]
-        close = candles[i]["close"]
+        prev_close, close = candles[i - 1]["close"], candles[i]["close"]
         prior_trend = trend_at_index(highs, lows, i)
-
-        eligible_highs = [
-            (n, p) for n, p in enumerate(highs)
-            if p["confirmed_at_index"] < i and n not in broken_highs
-        ]
-        eligible_lows = [
-            (n, p) for n, p in enumerate(lows)
-            if p["confirmed_at_index"] < i and n not in broken_lows
-        ]
-
+        eligible_highs = [(n, p) for n, p in enumerate(highs)
+                          if p["confirmed_at_index"] < i and n not in broken_highs]
+        eligible_lows = [(n, p) for n, p in enumerate(lows)
+                         if p["confirmed_at_index"] < i and n not in broken_lows]
         crossed_up = [(n, p) for n, p in eligible_highs
                       if prev_close <= p["price"] < close]
         crossed_down = [(n, p) for n, p in eligible_lows
                         if prev_close >= p["price"] > close]
 
-        # Record all levels crossed on this candle, but never re-emit the same pivot.
         for n, pivot in crossed_up:
-            event_type = (
-                "BOS" if prior_trend == "BULLISH"
-                else "CHoCH" if prior_trend == "BEARISH"
-                else "BULLISH_STRUCTURE_BREAK"
-            )
+            event_type = ("BOS" if prior_trend == "BULLISH" else
+                          "CHoCH" if prior_trend == "BEARISH" else
+                          "BULLISH_STRUCTURE_BREAK")
             events.append({
-                "event": event_type,
-                "direction": "BULLISH",
-                "level": pivot["price"],
-                "pivot_index": pivot["index"],
+                "event": event_type, "direction": "BULLISH",
+                "level": pivot["price"], "pivot_index": pivot["index"],
                 "pivot_datetime": pivot["datetime"],
                 "confirmed_at_index": pivot["confirmed_at_index"],
-                "break_candle_index": i,
-                "break_datetime": candles[i]["datetime"],
-                "previous_close": prev_close,
-                "latest_close": close,
-                "trend_before_break": prior_trend,
-                "confirmed_by_close": True
+                "break_candle_index": i, "break_datetime": candles[i]["datetime"],
+                "previous_close": prev_close, "latest_close": close,
+                "trend_before_break": prior_trend, "confirmed_by_close": True
             })
             broken_highs.add(n)
 
         for n, pivot in crossed_down:
-            event_type = (
-                "BOS" if prior_trend == "BEARISH"
-                else "CHoCH" if prior_trend == "BULLISH"
-                else "BEARISH_STRUCTURE_BREAK"
-            )
+            event_type = ("BOS" if prior_trend == "BEARISH" else
+                          "CHoCH" if prior_trend == "BULLISH" else
+                          "BEARISH_STRUCTURE_BREAK")
             events.append({
-                "event": event_type,
-                "direction": "BEARISH",
-                "level": pivot["price"],
-                "pivot_index": pivot["index"],
+                "event": event_type, "direction": "BEARISH",
+                "level": pivot["price"], "pivot_index": pivot["index"],
                 "pivot_datetime": pivot["datetime"],
                 "confirmed_at_index": pivot["confirmed_at_index"],
-                "break_candle_index": i,
-                "break_datetime": candles[i]["datetime"],
-                "previous_close": prev_close,
-                "latest_close": close,
-                "trend_before_break": prior_trend,
-                "confirmed_by_close": True
+                "break_candle_index": i, "break_datetime": candles[i]["datetime"],
+                "previous_close": prev_close, "latest_close": close,
+                "trend_before_break": prior_trend, "confirmed_by_close": True
             })
             broken_lows.add(n)
-
     return events
 
 
@@ -301,11 +240,9 @@ def analyze_structure_layer(candles, left, right, layer_name):
     state = classify_structure(highs, lows)
     events = detect_structure_events(candles, highs, lows)
     return {
-        "layer": layer_name,
-        "trend": state["trend"],
+        "layer": layer_name, "trend": state["trend"],
         "structure": state["structure"],
-        "swing_highs": highs[-10:],
-        "swing_lows": lows[-10:],
+        "swing_highs": highs[-10:], "swing_lows": lows[-10:],
         "structure_events": events[-20:],
         "total_confirmed_highs": len(highs),
         "total_confirmed_lows": len(lows),
@@ -317,49 +254,25 @@ def analyze_structure_layer(candles, left, right, layer_name):
 # LIQUIDITY / FVG / ORDER BLOCK / PREMIUM-DISCOUNT
 # ============================================================
 
-def detect_equal_levels(pivots, atr):
-    tolerance = max(0.01, atr * EQUAL_LEVEL_ATR_FRACTION)
-    pools, used = [], set()
-    for i, first in enumerate(pivots):
-        if i in used:
-            continue
-        matches = []
-        for j in range(i + 1, len(pivots)):
-            if abs(first["price"] - pivots[j]["price"]) <= tolerance:
-                matches.append((j, pivots[j]))
-        if matches:
-            group = [first] + [item[1] for item in matches]
-            for j, _ in matches:
-                used.add(j)
-            pools.append({
-                "type": "EQUAL_HIGH" if "high" in first else "EQUAL_LEVEL",
-                "level": sum(p["price"] for p in group) / len(group),
-                "touches": len(group),
-                "pivots": [{"price": p["price"], "datetime": p["datetime"], "index": p["index"]} for p in group]
-            })
-    return pools
-
-
 def detect_liquidity(candles, highs, lows, atr):
     tolerance = max(0.01, atr * EQUAL_LEVEL_ATR_FRACTION)
     equal_highs, equal_lows = [], []
     for pivots, output, label in ((highs, equal_highs, "EQUAL_HIGHS"),
                                   (lows, equal_lows, "EQUAL_LOWS")):
         consumed = set()
-        for i, p in enumerate(pivots):
+        for i, pivot in enumerate(pivots):
             if i in consumed:
                 continue
-            group = [p]
+            group = [pivot]
             for j in range(i + 1, len(pivots)):
-                if abs(p["price"] - pivots[j]["price"]) <= tolerance:
+                if abs(pivot["price"] - pivots[j]["price"]) <= tolerance:
                     group.append(pivots[j])
                     consumed.add(j)
             if len(group) >= 2:
                 output.append({
                     "type": label,
                     "level": sum(x["price"] for x in group) / len(group),
-                    "touches": len(group),
-                    "last_touch": group[-1]["datetime"]
+                    "touches": len(group), "last_touch": group[-1]["datetime"]
                 })
 
     sweeps = []
@@ -368,28 +281,16 @@ def detect_liquidity(candles, highs, lows, atr):
         known_lows = [p for p in lows if p["confirmed_at_index"] < i]
         for p in known_highs:
             if candle["high"] > p["price"] and candle["close"] < p["price"]:
-                sweeps.append({
-                    "type": "BUY_SIDE_LIQUIDITY_SWEEP",
-                    "level": p["price"],
-                    "datetime": candle["datetime"],
-                    "index": i,
-                    "pivot_datetime": p["datetime"]
-                })
+                sweeps.append({"type": "BUY_SIDE_LIQUIDITY_SWEEP",
+                               "level": p["price"], "datetime": candle["datetime"],
+                               "index": i, "pivot_datetime": p["datetime"]})
         for p in known_lows:
             if candle["low"] < p["price"] and candle["close"] > p["price"]:
-                sweeps.append({
-                    "type": "SELL_SIDE_LIQUIDITY_SWEEP",
-                    "level": p["price"],
-                    "datetime": candle["datetime"],
-                    "index": i,
-                    "pivot_datetime": p["datetime"]
-                })
-
-    return {
-        "equal_highs": equal_highs[-10:],
-        "equal_lows": equal_lows[-10:],
-        "sweeps": sweeps[-20:]
-    }
+                sweeps.append({"type": "SELL_SIDE_LIQUIDITY_SWEEP",
+                               "level": p["price"], "datetime": candle["datetime"],
+                               "index": i, "pivot_datetime": p["datetime"]})
+    return {"equal_highs": equal_highs[-10:], "equal_lows": equal_lows[-10:],
+            "sweeps": sweeps[-20:]}
 
 
 def detect_fvgs(candles):
@@ -397,85 +298,70 @@ def detect_fvgs(candles):
     for i in range(2, len(candles)):
         a, c = candles[i - 2], candles[i]
         if c["low"] > a["high"]:
-            zones.append({
-                "type": "BULLISH_FVG",
-                "low": a["high"],
-                "high": c["low"],
-                "midpoint": (a["high"] + c["low"]) / 2,
-                "formed_at": c["datetime"],
-                "formed_index": i
-            })
+            zones.append({"type": "BULLISH_FVG", "low": a["high"],
+                          "high": c["low"], "midpoint": (a["high"] + c["low"]) / 2,
+                          "formed_at": c["datetime"], "formed_index": i})
         elif c["high"] < a["low"]:
-            zones.append({
-                "type": "BEARISH_FVG",
-                "low": c["high"],
-                "high": a["low"],
-                "midpoint": (c["high"] + a["low"]) / 2,
-                "formed_at": c["datetime"],
-                "formed_index": i
-            })
+            zones.append({"type": "BEARISH_FVG", "low": c["high"],
+                          "high": a["low"], "midpoint": (c["high"] + a["low"]) / 2,
+                          "formed_at": c["datetime"], "formed_index": i})
 
-    # Mark whether price has subsequently traded back into each zone.
     for zone in zones:
         later = candles[zone["formed_index"] + 1:]
         zone["mitigated"] = any(
-            c["low"] <= zone["high"] and c["high"] >= zone["low"]
-            for c in later
-        )
-    return zones[-20:]
+            c["low"] <= zone["high"] and c["high"] >= zone["low"] for c in later)
+    return zones[-30:]
 
 
 def detect_order_blocks(candles, atr):
-    blocks = []
+    """Basic displacement-based OBs with duplicate suppression."""
+    blocks, seen = [], set()
     if len(candles) < 4:
         return blocks
     bodies = [abs(c["close"] - c["open"]) for c in candles]
     for i in range(2, len(candles)):
         current = candles[i]
-        avg_body = sum(bodies[max(0, i - 10):i]) / max(1, len(bodies[max(0, i - 10):i]))
+        prior_bodies = bodies[max(0, i - 10):i]
+        avg_body = sum(prior_bodies) / max(1, len(prior_bodies))
         displacement = abs(current["close"] - current["open"]) >= max(avg_body * 1.5, atr * 0.5)
-        if not displacement:
+        if not displacement or same_price(current["close"], current["open"]):
             continue
         direction = "BULLISH" if current["close"] > current["open"] else "BEARISH"
-        # Find the nearest prior candle opposing the displacement.
         for j in range(i - 1, max(-1, i - 6), -1):
             prior = candles[j]
-            opposing = (
-                prior["close"] < prior["open"] if direction == "BULLISH"
-                else prior["close"] > prior["open"]
-            )
-            if opposing:
+            opposing = (prior["close"] < prior["open"] if direction == "BULLISH"
+                        else prior["close"] > prior["open"])
+            if not opposing:
+                continue
+            key = (direction, j, round(prior["low"], 8), round(prior["high"], 8))
+            if key not in seen:
+                seen.add(key)
                 blocks.append({
                     "type": direction + "_ORDER_BLOCK",
-                    "low": prior["low"],
-                    "high": prior["high"],
-                    "datetime": prior["datetime"],
-                    "formed_by": current["datetime"],
-                    "formed_index": i,
+                    "low": prior["low"], "high": prior["high"],
+                    "datetime": prior["datetime"], "formed_by": current["datetime"],
+                    "formed_index": i, "origin_index": j,
                     "mitigated": any(
                         later["low"] <= prior["high"] and later["high"] >= prior["low"]
-                        for later in candles[i + 1:]
-                    )
+                        for later in candles[i + 1:])
                 })
-                break
-    return blocks[-15:]
+            break
+    return blocks[-30:]
 
 
 def premium_discount(candles, highs, lows):
     if not highs or not lows:
-        return {"status": "unavailable", "range_high": None, "range_low": None, "equilibrium": None}
-    # Use the latest confirmed external high/low, not future/unconfirmed pivots.
-    high = highs[-1]["price"]
-    low = lows[-1]["price"]
-    if high <= low:
-        return {"status": "unavailable", "range_high": high, "range_low": low, "equilibrium": None}
-    eq = (high + low) / 2
+        return {"status": "unavailable", "range_high": None,
+                "range_low": None, "equilibrium": None}
+    high_pivot, low_pivot = highs[-1], lows[-1]
+    if high_pivot["price"] <= low_pivot["price"]:
+        return {"status": "unavailable", "range_high": high_pivot["price"],
+                "range_low": low_pivot["price"], "equilibrium": None}
+    eq = (high_pivot["price"] + low_pivot["price"]) / 2
     price = candles[-1]["close"]
     return {
-        "status": "available",
-        "range_high": high,
-        "range_low": low,
-        "equilibrium": eq,
+        "status": "available", "range_high": high_pivot["price"],
+        "range_low": low_pivot["price"], "equilibrium": eq,
         "current_price": price,
         "zone": "DISCOUNT" if price < eq else "PREMIUM" if price > eq else "EQUILIBRIUM"
     }
@@ -488,52 +374,39 @@ def premium_discount(candles, highs, lows):
 def analyze_timeframe(section):
     if not isinstance(section, dict):
         return {"status": "error", "message": "Invalid timeframe object"}
-
     try:
         candles, data_quality = normalize_candles(section)
     except ValueError as exc:
         return {"status": "error", "message": str(exc)}
 
     if len(candles) < MIN_COMPLETE_CANDLES:
-        return {
-            "status": "insufficient_data",
-            **data_quality,
-            "reason": "Insufficient complete candles"
-        }
+        return {"status": "insufficient_data", **data_quality,
+                "reason": "Insufficient complete candles"}
 
     atr = calculate_atr(candles)
     swing = analyze_structure_layer(candles, SWING_LEFT, SWING_RIGHT, "SWING")
     internal = analyze_structure_layer(candles, INTERNAL_LEFT, INTERNAL_RIGHT, "INTERNAL")
     highs, lows = find_pivots(candles, SWING_LEFT, SWING_RIGHT)
-
     liquidity = detect_liquidity(candles, highs, lows, atr)
     fvgs = detect_fvgs(candles)
     order_blocks = detect_order_blocks(candles, atr)
     pd = premium_discount(candles, highs, lows)
 
     return {
-        "status": "analyzed",
-        **data_quality,
-        "timestamp_reliable": True,
+        "status": "analyzed", **data_quality,
         "latest_datetime": candles[-1]["datetime"],
-        "latest_close": candles[-1]["close"],
-        "atr": atr,
-        "trend": swing["trend"],
-        "structure": swing["structure"],
-        "swing_highs": swing["swing_highs"],
-        "swing_lows": swing["swing_lows"],
+        "latest_close": candles[-1]["close"], "atr": atr,
+        "trend": swing["trend"], "structure": swing["structure"],
+        "swing_highs": swing["swing_highs"], "swing_lows": swing["swing_lows"],
         "structure_events": swing["structure_events"],
         "internal_structure": {
-            "trend": internal["trend"],
-            "structure": internal["structure"],
+            "trend": internal["trend"], "structure": internal["structure"],
             "swing_highs": internal["swing_highs"],
             "swing_lows": internal["swing_lows"],
             "structure_events": internal["structure_events"]
         },
-        "liquidity": liquidity,
-        "fair_value_gaps": fvgs,
-        "order_blocks": order_blocks,
-        "premium_discount": pd,
+        "liquidity": liquidity, "fair_value_gaps": fvgs,
+        "order_blocks": order_blocks, "premium_discount": pd,
         "structure_quality": {
             "confirmed_swing_highs": swing["total_confirmed_highs"],
             "confirmed_swing_lows": swing["total_confirmed_lows"],
@@ -545,11 +418,9 @@ def analyze_timeframe(section):
 
 
 def calculate_overall_structure(results):
-    usable = [
-        results[tf]["trend"] for tf in TIMEFRAMES
-        if results.get(tf, {}).get("status") == "analyzed"
-        and results[tf]["trend"] in ("BULLISH", "BEARISH")
-    ]
+    usable = [results[tf]["trend"] for tf in TIMEFRAMES
+              if results.get(tf, {}).get("status") == "analyzed"
+              and results[tf]["trend"] in ("BULLISH", "BEARISH")]
     if len(usable) < 3:
         return "UNCONFIRMED"
     bullish, bearish = usable.count("BULLISH"), usable.count("BEARISH")
@@ -568,44 +439,183 @@ def latest_signal_event(tf_result):
     events = tf_result.get("structure_events", [])
     if not events:
         return None
-    return events[-1]
+    # Return the last event in chronological candle order.
+    return max(events, key=lambda e: e.get("break_candle_index", -1))
 
 
-def latest_active_zone(tf_result, direction):
+def collect_active_zones(tf_result, direction):
     expected_fvg = "BULLISH_FVG" if direction == "BUY" else "BEARISH_FVG"
     expected_ob = "BULLISH_ORDER_BLOCK" if direction == "BUY" else "BEARISH_ORDER_BLOCK"
-
     zones = []
+
     for z in tf_result.get("fair_value_gaps", []):
-        if z["type"] == expected_fvg and not z["mitigated"]:
+        if z.get("type") == expected_fvg and not z.get("mitigated", True):
             zones.append({
                 "source": "FVG", "low": z["low"], "high": z["high"],
                 "datetime": z["formed_at"], "formed_index": z["formed_index"]
             })
+
     for z in tf_result.get("order_blocks", []):
-        if z["type"] == expected_ob and not z["mitigated"]:
+        if z.get("type") == expected_ob and not z.get("mitigated", True):
             zones.append({
                 "source": "ORDER_BLOCK", "low": z["low"], "high": z["high"],
-                "datetime": z["datetime"], "formed_index": z["formed_index"]
+                "datetime": z["datetime"], "formed_index": z["formed_index"],
+                "origin_index": z.get("origin_index")
             })
-    return zones[-1] if zones else None
+
+    # Merge overlapping FVG/OB areas into one candidate with confluence credit.
+    zones.sort(key=lambda z: z.get("formed_index", -1))
+    merged = []
+    for zone in zones:
+        match = None
+        for existing in merged:
+            overlap = min(existing["high"], zone["high"]) - max(existing["low"], zone["low"])
+            if overlap >= 0:
+                match = existing
+                break
+        if match:
+            match["low"] = min(match["low"], zone["low"])
+            match["high"] = max(match["high"], zone["high"])
+            match["sources"] = sorted(set(match.get("sources", [match["source"]]) + [zone["source"]]))
+            match["formed_index"] = max(match["formed_index"], zone["formed_index"])
+            match["datetime"] = zone["datetime"] if zone["formed_index"] >= match["formed_index"] else match["datetime"]
+            match["source"] = "+".join(match["sources"])
+        else:
+            item = dict(zone)
+            item["sources"] = [zone["source"]]
+            merged.append(item)
+
+    # Suppress duplicate/near-identical zones even if their source differs.
+    unique = []
+    for zone in merged:
+        if not any(abs(zone["low"] - old["low"]) < 1e-8
+                   and abs(zone["high"] - old["high"]) < 1e-8 for old in unique):
+            unique.append(zone)
+    return unique
+
+
+def zone_distance(price, zone):
+    if price < zone["low"]:
+        return zone["low"] - price
+    if price > zone["high"]:
+        return price - zone["high"]
+    return 0.0
+
+
+def score_zone(zone, direction, tf_result, price, atr):
+    """Heuristic ranking score, not a probability or win-rate estimate."""
+    formed = int(zone.get("formed_index", 0))
+    age = max(0, len(tf_result.get("swing_highs", [])) * 0 + 
+              tf_result.get("complete", 0) - 1 - formed)
+    score = 35.0
+    sources = zone.get("sources", [zone.get("source", "UNKNOWN")])
+    if len(sources) > 1:
+        score += 12
+    if "ORDER_BLOCK" in sources:
+        score += 8
+    if "FVG" in sources:
+        score += 6
+    if age <= 8:
+        score += 12
+    elif age <= 20:
+        score += 8
+    elif age <= MAX_ZONE_AGE_CANDLES:
+        score += 3
+    else:
+        score -= 20
+
+    distance = zone_distance(price, zone)
+    if atr > 0:
+        if distance <= atr * 0.5:
+            score += 10
+        elif distance <= atr * MAX_ENTRY_DISTANCE_ATR:
+            score += 5
+        else:
+            score -= min(20, (distance / atr) * 4)
+
+    # Reward a matching recent sweep near the zone.
+    wanted_sweep = ("SELL_SIDE_LIQUIDITY_SWEEP" if direction == "BUY"
+                    else "BUY_SIDE_LIQUIDITY_SWEEP")
+    recent_sweeps = [s for s in tf_result.get("liquidity", {}).get("sweeps", [])
+                     if s.get("type") == wanted_sweep]
+    if any(abs(s.get("level", 0) - (zone["low"] + zone["high"]) / 2)
+           <= max(atr, 0.01) * 1.5 for s in recent_sweeps[-5:]):
+        score += 10
+
+    # A zone on the correct side of equilibrium is a modest confluence factor.
+    pd = tf_result.get("premium_discount", {})
+    if pd.get("status") == "available":
+        if direction == "BUY" and pd.get("zone") == "DISCOUNT":
+            score += 5
+        elif direction == "SELL" and pd.get("zone") == "PREMIUM":
+            score += 5
+
+    return max(0.0, min(100.0, score))
+
+
+def build_zone_plan(zone, direction, price, atr, tf_result):
+    low, high = float(zone["low"]), float(zone["high"])
+    entry = (low + high) / 2
+    buffer = max(atr * 0.20, 0.01)
+
+    if direction == "BUY":
+        stop = low - buffer
+        risk = entry - stop
+        rr_targets = [entry + risk * rr for rr in (1.5, 2.0, 3.0)]
+        liquidity_type = "EQUAL_HIGHS"
+        liquidity_levels = [x["level"] for x in tf_result.get("liquidity", {}).get("equal_highs", [])]
+        liquidity_levels += [x["price"] for x in tf_result.get("swing_highs", [])]
+        targets_direction = 1
+    else:
+        stop = high + buffer
+        risk = stop - entry
+        rr_targets = [entry - risk * rr for rr in (1.5, 2.0, 3.0)]
+        liquidity_type = "EQUAL_LOWS"
+        liquidity_levels = [x["level"] for x in tf_result.get("liquidity", {}).get("equal_lows", [])]
+        liquidity_levels += [x["price"] for x in tf_result.get("swing_lows", [])]
+        targets_direction = -1
+
+    if risk <= 0:
+        return None
+
+    # Nearby opposing-side liquidity is informational; RR targets remain the fallback.
+    if targets_direction == 1:
+        pools = sorted(set(x for x in liquidity_levels if x > entry))
+    else:
+        pools = sorted(set((x for x in liquidity_levels if x < entry)), reverse=True)
+
+    return {
+        "entry_zone": {"low": low, "high": high, "midpoint": entry},
+        "entry_reference": entry,
+        "stop_loss": stop,
+        "targets": {"tp1": rr_targets[0], "tp2": rr_targets[1], "tp3": rr_targets[2]},
+        "risk_reward": {"tp1": 1.5, "tp2": 2.0, "tp3": 3.0},
+        "liquidity_targets": pools[:5],
+        "liquidity_target_type": liquidity_type,
+        "risk_distance": risk,
+        "distance_from_current_price": zone_distance(price, zone)
+    }
 
 
 def build_entry_setup(results, overall):
-    # Entry timing is assessed on 15m; 1h is a secondary confirmation.
     fast = results.get("15min", {})
     hourly = results.get("1h", {})
     four_hour = results.get("4h", {})
     daily = results.get("1day", {})
 
-    if any(x.get("status") != "analyzed" for x in (fast, hourly, four_hour, daily)):
+    required = (fast, hourly, four_hour, daily)
+    if any(x.get("status") != "analyzed" for x in required):
         return {
-            "status": "WAIT",
-            "score": 0,
+            "status": "WAIT", "score": 0, "score_is_probability": False,
             "reason": "Required 15min, 1h, 4h and 1day data is not all available"
         }
 
-    candidates = []
+    price, atr = fast["latest_close"], fast["atr"]
+    if atr <= 0:
+        return {"status": "WAIT", "score": 0, "score_is_probability": False,
+                "reason": "ATR is unavailable or invalid"}
+
+    direction_candidates = []
     for direction in ("BUY", "SELL"):
         wanted = "BULLISH" if direction == "BUY" else "BEARISH"
         score, reasons = 0, []
@@ -627,83 +637,124 @@ def build_entry_setup(results, overall):
             reasons.append("15min structure agrees")
 
         event = latest_signal_event(fast)
-        if event and event["direction"] == wanted and event["event"] in ("BOS", "CHoCH"):
-            score += 15
-            reasons.append("Recent 15min close-confirmed BOS/CHoCH agrees")
+        if event and event.get("direction") == wanted and event.get("event") in ("BOS", "CHoCH"):
+            # Event must be recent on the 15m sample.
+            age = len(fast.get("swing_highs", [])) * 0 + fast.get("complete", 0) - 1 - event.get("break_candle_index", 0)
+            if age <= 8:
+                score += 15
+                reasons.append("Recent 15min close-confirmed BOS/CHoCH agrees")
 
-        sweep_type = "SELL_SIDE_LIQUIDITY_SWEEP" if direction == "BUY" else "BUY_SIDE_LIQUIDITY_SWEEP"
-        if any(s["type"] == sweep_type for s in fast["liquidity"]["sweeps"][-3:]):
+        sweep_type = ("SELL_SIDE_LIQUIDITY_SWEEP" if direction == "BUY"
+                      else "BUY_SIDE_LIQUIDITY_SWEEP")
+        if any(s.get("type") == sweep_type and
+               fast.get("complete", 0) - 1 - s.get("index", 0) <= 5
+               for s in fast.get("liquidity", {}).get("sweeps", [])):
             score += 10
             reasons.append("Recent liquidity sweep supports the setup")
 
-        zone = latest_active_zone(fast, direction)
-        if zone:
+        zones = collect_active_zones(fast, direction)
+        ranked = []
+        for zone in zones:
+            age = fast.get("complete", 0) - 1 - zone.get("formed_index", 0)
+            if age < 0 or age > MAX_ZONE_AGE_CANDLES:
+                continue
+            zscore = score_zone(zone, direction, fast, price, atr)
+            distance = zone_distance(price, zone)
+            plan = build_zone_plan(zone, direction, price, atr, fast)
+            if plan is None:
+                continue
+            ranked.append({
+                **zone, "zone_score": round(zscore, 2),
+                "age_candles": age, "plan": plan,
+                "within_entry_distance": distance <= atr * MAX_ENTRY_DISTANCE_ATR
+            })
+
+        ranked.sort(key=lambda z: (z["zone_score"], -z["plan"]["distance_from_current_price"]),
+                    reverse=True)
+
+        best_zone = ranked[0] if ranked else None
+        if best_zone:
             score += 10
-            reasons.append("Unmitigated 15min FVG/order-block zone exists")
+            reasons.append("At least one active, unmitigated 15min reaction zone exists")
 
-        candidates.append((score, direction, reasons, zone))
+        direction_candidates.append({
+            "direction": direction, "base_score": min(100, score),
+            "reasons": reasons, "zones": ranked
+        })
 
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    score, direction, reasons, zone = candidates[0]
+    direction_candidates.sort(key=lambda x: x["base_score"], reverse=True)
+    chosen = direction_candidates[0]
+    direction = chosen["direction"]
+    score = chosen["base_score"]
+    zones = chosen["zones"]
 
-    price = fast["latest_close"]
-    atr = fast["atr"]
-    if score < MIN_SETUP_SCORE or zone is None or atr <= 0:
+    if score < MIN_SETUP_SCORE or not zones:
         return {
-            "status": "WAIT",
-            "score": score,
-            "score_is_probability": False,
-            "reason": "No setup currently meets the configured confluence and zone requirements",
+            "status": "WAIT", "score": score, "score_is_probability": False,
             "best_candidate": direction,
-            "reasons": reasons
+            "reason": "No direction currently meets the confluence and valid-zone requirements",
+            "reasons": chosen["reasons"],
+            "alternative_direction_score": direction_candidates[1]["base_score"]
         }
 
-    distance = 0.0
-    if price < zone["low"]:
-        distance = zone["low"] - price
-    elif price > zone["high"]:
-        distance = price - zone["high"]
+    eligible = [z for z in zones if z["within_entry_distance"]]
+    # Main zone is the strongest valid zone, even if it is farther away.
+    main = zones[0]
+    # Alternative is the nearest other strong zone that is currently within distance.
+    alternatives = [z for z in eligible if z is not main and z["zone_score"] >= 55]
+    alternatives.sort(key=lambda z: z["plan"]["distance_from_current_price"])
+    backup = alternatives[0] if alternatives else None
 
-    if distance > atr * MAX_ENTRY_DISTANCE_ATR:
+    def public_zone(z, role):
+        if not z:
+            return None
         return {
-            "status": "WAIT",
-            "score": score,
-            "score_is_probability": False,
-            "reason": "Price is too far from the identified entry zone",
-            "best_candidate": direction,
-            "entry_zone": zone,
-            "reasons": reasons
+            "role": role,
+            "source": z.get("source"),
+            "sources": z.get("sources", [z.get("source")]),
+            "datetime": z.get("datetime"),
+            "formed_index": z.get("formed_index"),
+            "zone_score": z.get("zone_score"),
+            "age_candles": z.get("age_candles"),
+            "within_entry_distance": z.get("within_entry_distance"),
+            **z["plan"]
         }
 
-    entry_low, entry_high = zone["low"], zone["high"]
-    entry = (entry_low + entry_high) / 2
-    buffer = max(atr * 0.20, 0.01)
+    main_public = public_zone(main, "PRIMARY")
+    backup_public = public_zone(backup, "NEAREST_QUALIFIED_ALTERNATIVE")
+    extra = [public_zone(z, "ADDITIONAL") for z in zones[1:MAX_RETURNED_ZONES]
+             if z is not backup]
 
-    if direction == "BUY":
-        stop = zone["low"] - buffer
-        risk = entry - stop
-        targets = [entry + risk * rr for rr in (1.5, 2.0, 3.0)]
+    if not main["within_entry_distance"]:
+        status = "WAIT"
+        reason = "Strongest zone is identified but price is outside the configured entry-distance limit"
     else:
-        stop = zone["high"] + buffer
-        risk = stop - entry
-        targets = [entry - risk * rr for rr in (1.5, 2.0, 3.0)]
-
-    if risk <= 0:
-        return {"status": "WAIT", "score": score, "reason": "Invalid risk calculation"}
+        status = "POTENTIAL_SETUP"
+        reason = "A qualified reaction zone is within the configured entry-distance limit"
 
     return {
-        "status": "POTENTIAL_SETUP",
+        "status": status,
         "direction": direction,
         "score": score,
         "score_is_probability": False,
-        "entry_zone": {"low": entry_low, "high": entry_high, "midpoint": entry},
-        "entry_reference": entry,
-        "stop_loss": stop,
-        "targets": {"tp1": targets[0], "tp2": targets[1], "tp3": targets[2]},
-        "risk_reward": {"tp1": 1.5, "tp2": 2.0, "tp3": 3.0},
-        "zone_source": zone["source"],
-        "reasons": reasons,
-        "warning": "A rule-based research signal, not a guarantee or an automatic trade instruction."
+        "reason": reason,
+        "best_candidate": direction,
+        "current_price": price,
+        "primary_zone": main_public,
+        "nearest_alternative_zone": backup_public,
+        "additional_zones": extra,
+        # Backward-compatible fields used by the previous output consumer.
+        "entry_zone": main_public["entry_zone"],
+        "entry_reference": main_public["entry_reference"],
+        "stop_loss": main_public["stop_loss"],
+        "targets": main_public["targets"],
+        "risk_reward": main_public["risk_reward"],
+        "zone_source": main_public["source"],
+        "reasons": chosen["reasons"],
+        "warning": (
+            "Heuristic research analysis only. Scores are not probabilities. "
+            "No zone is guaranteed to reverse price; validate with out-of-sample backtesting."
+        )
     }
 
 
@@ -714,7 +765,6 @@ def build_entry_setup(results, overall):
 def build_analysis(data):
     if not isinstance(data, dict):
         return None, "Invalid report object"
-
     timeframes = data.get("timeframes")
     if not isinstance(timeframes, dict):
         return None, "Missing timeframes object"
@@ -732,7 +782,6 @@ def build_analysis(data):
 
     overall = calculate_overall_structure(results)
     entry = build_entry_setup(results, overall)
-
     return {
         "status": "success",
         "symbol": data.get("summary", {}).get("symbol", SYMBOL),
@@ -745,8 +794,8 @@ def build_analysis(data):
         "entry_analysis": entry,
         "decision": "WAIT" if entry["status"] == "WAIT" else "POTENTIAL_SETUP",
         "message": (
-            "Analysis completed. Entry score is a rule-confluence score, not a win probability. "
-            "Validate all parameters with historical out-of-sample testing before live use."
+            "Analysis completed. Entry scores are heuristic confluence scores, not win probabilities. "
+            "Historical out-of-sample testing is required before live use."
         )
     }, None
 
@@ -754,17 +803,15 @@ def build_analysis(data):
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
-        "status": "ready",
-        "engine": ENGINE_NAME,
-        "version": VERSION,
-        "symbol": SYMBOL,
-        "timeframes": TIMEFRAMES,
+        "status": "ready", "engine": ENGINE_NAME, "version": VERSION,
+        "symbol": SYMBOL, "timeframes": TIMEFRAMES,
         "modules": [
             "Data Validation", "Swing/Internal Market Structure",
             "Historical BOS/CHoCH", "Liquidity Pools/Sweeps",
-            "Fair Value Gaps", "Basic Order Blocks",
+            "Fair Value Gaps", "Duplicate-Suppressed Basic Order Blocks",
             "Premium/Discount", "Multi-Timeframe Analysis",
-            "Rule-Based Entry Scoring", "Risk/Reward Levels"
+            "Ranked Reaction Zones", "Primary and Nearest Alternative Zones",
+            "Risk/Reward Levels", "Potential Liquidity Targets"
         ]
     })
 
@@ -774,15 +821,12 @@ def analyze():
     data = request.get_json(silent=True)
     if data is None:
         return jsonify({"status": "error", "message": "No JSON data received"}), 400
-
     if isinstance(data, list):
         if len(data) != 1 or not isinstance(data[0], dict):
             return jsonify({"status": "error", "message": "Expected one report object"}), 400
         data = data[0]
-
     if not isinstance(data, dict):
         return jsonify({"status": "error", "message": "Invalid JSON structure"}), 400
-
     try:
         result, error = build_analysis(data)
         if error:
