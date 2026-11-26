@@ -1,5 +1,6 @@
 import os
 import math
+import json
 import logging
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -7,7 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from flask import Flask, request, jsonify
 
-VERSION = "5.3.0"
+VERSION = "5.4.0"
 ENGINE_NAME = "Gold Analysis Engine"
 SYMBOL = "XAU/USD"
 TIMEFRAMES = ["15min", "1h", "4h", "1day", "1week", "1month"]
@@ -128,34 +129,73 @@ def unwrap_payload(payload: Any) -> Any:
     return candidate
 
 
-def find_source_timezone(payload: Any) -> Optional[str]:
-    """Read an explicit IANA timezone from payload metadata or environment.
+# Twelve Data source contract for this XAU/USD workflow:
+# - Intraday nodes explicitly request timezone=UTC.
+# - Daily/weekly/monthly bars ignore the timezone query parameter and use
+#   the XAU/USD Commodity exchange timezone, Australia/Sydney.
+# Every value can be overridden explicitly through environment variables.
+DEFAULT_SOURCE_TIMEZONES = {
+    "15min": "UTC", "1h": "UTC", "4h": "UTC",
+    "1day": "Australia/Sydney", "1week": "Australia/Sydney",
+    "1month": "Australia/Sydney",
+}
 
-    `exchange_local` is a timestamp convention label, NOT a timezone name,
-    so it is deliberately not treated as a timezone.
+
+def find_source_timezone(payload: Any, timeframe: str,
+                         timeframe_payload: Any = None) -> Optional[str]:
+    """Resolve the timestamp timezone for one timeframe, never by guessing.
+
+    Precedence: per-timeframe environment override, JSON mapping override,
+    explicit timeframe metadata, global override, then the documented
+    Twelve Data XAU/USD source contract above.
     """
-    env_zone = os.getenv("SOURCE_TIMEZONE", "").strip()
-    if env_zone:
-        return env_zone
-    keys = {"source_timezone", "exchange_timezone", "timezone", "tz"}
-    found = []
-    def walk(obj: Any, depth: int = 0) -> None:
-        if depth > 6:
-            return
-        if isinstance(obj, dict):
-            for key, value in obj.items():
-                if str(key).lower() in keys and isinstance(value, str) and value.strip():
-                    found.append(value.strip())
-                elif isinstance(value, (dict, list)):
-                    walk(value, depth + 1)
-        elif isinstance(obj, list):
-            for item in obj[:5]:
-                walk(item, depth + 1)
-    walk(payload)
-    unique = list(dict.fromkeys(found))
-    if len(unique) > 1:
-        raise ValueError("conflicting_source_timezones:" + ",".join(unique))
-    return unique[0] if unique else None
+    tf_env = os.getenv("SOURCE_TIMEZONE_" + timeframe.upper(), "").strip()
+    if tf_env:
+        zone = tf_env
+    else:
+        mapping_raw = os.getenv("SOURCE_TIMEZONE_BY_TIMEFRAME", "").strip()
+        mapping = {}
+        if mapping_raw:
+            try:
+                mapping = json.loads(mapping_raw)
+            except json.JSONDecodeError as exc:
+                raise ValueError("invalid_SOURCE_TIMEZONE_BY_TIMEFRAME_JSON") from exc
+            if not isinstance(mapping, dict):
+                raise ValueError("SOURCE_TIMEZONE_BY_TIMEFRAME_must_be_object")
+        zone = str(mapping.get(timeframe, "")).strip()
+        if not zone and isinstance(timeframe_payload, (dict, list)):
+            keys = {"source_timezone", "exchange_timezone", "timezone", "tz"}
+            found = []
+            def walk(obj: Any, depth: int = 0) -> None:
+                if depth > 5:
+                    return
+                if isinstance(obj, dict):
+                    for key, value in obj.items():
+                        if str(key).lower() in keys and isinstance(value, str) and value.strip():
+                            found.append(value.strip())
+                        elif isinstance(value, (dict, list)):
+                            walk(value, depth + 1)
+                elif isinstance(obj, list):
+                    for item in obj[:5]:
+                        walk(item, depth + 1)
+            walk(timeframe_payload)
+            unique = list(dict.fromkeys(found))
+            if len(unique) > 1:
+                raise ValueError(f"{timeframe}:conflicting_source_timezones:" + ",".join(unique))
+            zone = unique[0] if unique else ""
+        if not zone:
+            zone = os.getenv("SOURCE_TIMEZONE", "").strip()
+        if not zone:
+            zone = DEFAULT_SOURCE_TIMEZONES.get(timeframe, "")
+    if not zone:
+        return None
+    if zone.lower() in {"exchange_local", "local", "server_local"}:
+        raise ValueError("source_timezone_must_be_an_iana_timezone_not_a_convention_label")
+    try:
+        ZoneInfo(zone)
+    except ZoneInfoNotFoundError as exc:
+        raise ValueError(f"unknown_source_timezone:{zone}") from exc
+    return zone
 
 
 def _month_after(dt: datetime) -> datetime:
@@ -183,18 +223,6 @@ def normalize_payload(payload: Any) -> Tuple[Dict[str, List[dict]], List[str], L
     diagnostics: Dict[str, dict] = {}
     now = datetime.now(timezone.utc)
     now_ts = now.timestamp()
-    try:
-        source_timezone = find_source_timezone(payload)
-        if source_timezone:
-            if source_timezone.strip().lower() in {"exchange_local", "local", "server_local"}:
-                raise ValueError("source_timezone_must_be_an_iana_timezone_not_a_convention_label")
-            ZoneInfo(source_timezone)
-            notes.append(f"naive_timestamps_interpreted_in_timezone:{source_timezone}")
-        else:
-            notes.append("timezone_not_assumed:naive_timestamps_will_be_rejected")
-    except (ValueError, ZoneInfoNotFoundError) as exc:
-        return {}, [str(exc)], notes, diagnostics
-
     raw_frames = unwrap_payload(payload)
     if not isinstance(raw_frames, dict):
         return {}, ["timeframes_must_be_object"], notes, diagnostics
@@ -212,6 +240,20 @@ def normalize_payload(payload: Any) -> Tuple[Dict[str, List[dict]], List[str], L
             errors.append(f"{tf}:candles_must_be_array")
             diagnostics[tf] = {"input_count": 0, "parsed_count": 0, "complete_count": 0,
                                "incomplete_count": 0, "invalid_count": 0, "duplicate_count": 0}
+            continue
+
+        try:
+            source_timezone = find_source_timezone(payload, tf, raw)
+            if source_timezone:
+                notes.append(f"{tf}:naive_timestamps_interpreted_in_timezone:{source_timezone}")
+            else:
+                notes.append(f"{tf}:timezone_not_assumed:naive_timestamps_will_be_rejected")
+        except (ValueError, ZoneInfoNotFoundError) as exc:
+            errors.append(f"{tf}:{str(exc)}")
+            frames[tf] = []
+            diagnostics[tf] = {"input_count": len(rows), "parsed_count": 0, "complete_count": 0,
+                               "incomplete_count": 0, "invalid_count": len(rows), "duplicate_count": 0,
+                               "source_timezone": None}
             continue
 
         input_count = len(rows)
@@ -285,7 +327,8 @@ def normalize_payload(payload: Any) -> Tuple[Dict[str, List[dict]], List[str], L
             "invalid_count": invalid_count,
             "duplicate_count": duplicate_count,
             "future_timestamp_count": future_count,
-            "timestamp_type": CANDLE_TIMESTAMP_TYPE
+            "timestamp_type": CANDLE_TIMESTAMP_TYPE,
+            "source_timezone": source_timezone
         }
         if len(complete) < MIN_COMPLETE_CANDLES:
             errors.append(f"{tf}:insufficient_complete_candles:{len(complete)}<{MIN_COMPLETE_CANDLES}")
@@ -354,7 +397,7 @@ def data_quality_report(frames: Dict[str, List[dict]], errors: List[str],
         "max_candles_per_timeframe": MAX_CANDLES,
         "minimum_complete_candles": MIN_COMPLETE_CANDLES,
         "preferred_complete_candles": PREFERRED_COMPLETE_CANDLES,
-        "source_timezone": next((n.split(":", 1)[1] for n in notes if n.startswith("naive_timestamps_interpreted_in_timezone:")), None),
+        "source_timezones_by_timeframe": {tf: diagnostics.get(tf, {}).get("source_timezone") for tf in TIMEFRAMES},
         "candle_timestamp_type": CANDLE_TIMESTAMP_TYPE,
         "timeframes": report,
         "errors": errors,
@@ -876,8 +919,12 @@ def health():
         "minimum_complete_candles": MIN_COMPLETE_CANDLES,
         "preferred_complete_candles": PREFERRED_COMPLETE_CANDLES,
         "configured_source_timezone": os.getenv("SOURCE_TIMEZONE") or None,
+        "source_timezones_by_timeframe": {
+            tf: os.getenv("SOURCE_TIMEZONE_" + tf.upper()) or DEFAULT_SOURCE_TIMEZONES.get(tf)
+            for tf in TIMEFRAMES
+        },
         "candle_timestamp_type": CANDLE_TIMESTAMP_TYPE,
-        "timestamp_policy": "epoch or timezone-offset timestamps accepted; naive timestamps require SOURCE_TIMEZONE or payload timezone metadata"
+        "timestamp_policy": "epoch or timezone-offset timestamps accepted; naive timestamps use the documented per-timeframe XAU/USD source timezone unless explicitly overridden"
     })
 
 
