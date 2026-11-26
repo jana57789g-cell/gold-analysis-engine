@@ -2,11 +2,12 @@ import os
 import math
 import logging
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Any, Dict, List, Optional, Tuple
 
 from flask import Flask, request, jsonify
 
-VERSION = "5.0.0"
+VERSION = "5.1.0"
 ENGINE_NAME = "Gold Analysis Engine"
 SYMBOL = "XAU/USD"
 TIMEFRAMES = ["15min", "1h", "4h", "1day", "1week", "1month"]
@@ -27,7 +28,7 @@ logger = logging.getLogger("gold_analysis_engine")
 # Safe input normalization
 # ---------------------------------------------------------------------------
 
-def parse_time(value: Any) -> datetime:
+def parse_time(value: Any, source_timezone: str = "UTC") -> datetime:
     if isinstance(value, bool):
         raise ValueError("invalid_timestamp")
     if isinstance(value, (int, float)):
@@ -55,8 +56,13 @@ def parse_time(value: Any) -> datetime:
         if dt is None:
             raise ValueError("unparseable_timestamp")
     if dt.tzinfo is None:
-        # Naive timestamps are explicitly interpreted as UTC and reported.
-        dt = dt.replace(tzinfo=timezone.utc)
+        # TradingView/exported exchange-local strings may have no UTC offset.
+        # Interpret them only in an explicitly configured/provider-supplied zone.
+        try:
+            source_tz = ZoneInfo(source_timezone)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError(f"unknown_source_timezone:{source_timezone}") from exc
+        dt = dt.replace(tzinfo=source_tz)
     return dt.astimezone(timezone.utc)
 
 
@@ -113,9 +119,45 @@ def unwrap_payload(payload: Any) -> Any:
     return candidate
 
 
+def find_source_timezone(payload: Any) -> str:
+    """Read an explicit IANA timezone from payload metadata or environment.
+
+    `exchange_local` is a timestamp convention label, NOT a timezone name,
+    so it is deliberately not treated as a timezone.
+    """
+    env_zone = os.getenv("SOURCE_TIMEZONE", "").strip()
+    if env_zone:
+        return env_zone
+    keys = {"source_timezone", "exchange_timezone", "timezone", "tz"}
+    found = []
+    def walk(obj: Any, depth: int = 0) -> None:
+        if depth > 6:
+            return
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if str(key).lower() in keys and isinstance(value, str) and value.strip():
+                    found.append(value.strip())
+                elif isinstance(value, (dict, list)):
+                    walk(value, depth + 1)
+        elif isinstance(obj, list):
+            for item in obj[:5]:
+                walk(item, depth + 1)
+    walk(payload)
+    unique = list(dict.fromkeys(found))
+    if len(unique) > 1:
+        raise ValueError("conflicting_source_timezones:" + ",".join(unique))
+    return unique[0] if unique else "UTC"
+
+
 def normalize_payload(payload: Any) -> Tuple[Dict[str, List[dict]], List[str], List[str]]:
     errors: List[str] = []
     notes: List[str] = []
+    try:
+        source_timezone = find_source_timezone(payload)
+        ZoneInfo(source_timezone)
+    except (ValueError, ZoneInfoNotFoundError) as exc:
+        return {}, [str(exc)], notes
+    notes.append(f"naive_timestamps_interpreted_in_timezone:{source_timezone}")
     raw_frames = unwrap_payload(payload)
     if not isinstance(raw_frames, dict):
         return {}, ["timeframes_must_be_object"], notes
@@ -140,7 +182,7 @@ def normalize_payload(payload: Any) -> Tuple[Dict[str, List[dict]], List[str], L
                 if not isinstance(row, dict):
                     raise ValueError("candle_must_be_object")
                 raw_dt = row.get("datetime", row.get("timestamp", row.get("time", row.get("date"))))
-                dt = parse_time(raw_dt)
+                dt = parse_time(raw_dt, source_timezone)
                 o = number(row.get("open"), "open")
                 h = number(row.get("high"), "high")
                 lo = number(row.get("low"), "low")
@@ -229,6 +271,7 @@ def data_quality_report(frames: Dict[str, List[dict]], errors: List[str],
         "status": "VALID" if valid else "INVALID",
         "analysis_blocked": not valid,
         "max_candles_per_timeframe": MAX_CANDLES,
+        "source_timezone": next((n.split(":", 1)[1] for n in notes if n.startswith("naive_timestamps_interpreted_in_timezone:")), "timestamp_offsets_or_epoch"),
         "timeframes": report,
         "errors": errors,
         "warnings": warnings,
@@ -734,7 +777,8 @@ def health():
     return jsonify({
         "status": "ok", "engine": ENGINE_NAME, "version": VERSION,
         "symbol": SYMBOL, "timeframes": TIMEFRAMES,
-        "max_candles_per_timeframe": MAX_CANDLES
+        "max_candles_per_timeframe": MAX_CANDLES,
+        "configured_source_timezone": os.getenv("SOURCE_TIMEZONE", "UTC")
     })
 
 
