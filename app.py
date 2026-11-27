@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from flask import Flask, request, jsonify
 
-VERSION = "6.1.0"
+VERSION = "7.0.1"
 ENGINE_NAME = "Gold Analysis Engine"
 SYMBOL = "XAU/USD"
 TIMEFRAMES = ["15min", "1h", "4h", "1day", "1week", "1month"]
@@ -24,7 +24,11 @@ if not 1 <= MIN_COMPLETE_CANDLES <= MAX_CANDLES:
     raise ValueError("MIN_COMPLETE_CANDLES must be between 1 and MAX_CANDLES")
 PREFERRED_COMPLETE_CANDLES = 30
 FUTURE_TOLERANCE_SECONDS = 60
-LIVE_QUOTE_REQUIRED = os.getenv("LIVE_QUOTE_REQUIRED", "true").strip().lower() in {"1", "true", "yes", "on"}
+# A live quote is preferred, but never required for analysis-plan generation.
+# If it is missing/stale/invalid, the engine uses the latest completed 15m close
+# and labels every resulting level as a reference, not a live execution price.
+# Kept as False for backward-compatible API metadata; legacy env setting is ignored.
+LIVE_QUOTE_REQUIRED = False
 LIVE_QUOTE_MAX_AGE_SECONDS = int(os.getenv("LIVE_QUOTE_MAX_AGE_SECONDS", "180"))
 if LIVE_QUOTE_MAX_AGE_SECONDS < 1:
     raise ValueError("LIVE_QUOTE_MAX_AGE_SECONDS must be positive")
@@ -321,7 +325,7 @@ def normalize_payload(payload: Any) -> Tuple[Dict[str, List[dict]], List[str], L
         input_count = len(rows)
         parsed: List[dict] = []
         invalid_count = 0
-        future_count = 0
+                future_count = 0
         for idx, row in enumerate(rows):
             try:
                 if not isinstance(row, dict):
@@ -648,7 +652,7 @@ def build_zones(candles: List[dict], current: float, side: str, tf: str) -> List
                 tests += 1
             inside = overlaps
         if tests > 3:
-            continue
+                        continue
         mid = (lo + hi) / 2
         # A buy zone must be below price; a sell zone must be above price.
         if side == "BUY" and mid >= current:
@@ -666,7 +670,10 @@ def build_zones(candles: List[dict], current: float, side: str, tf: str) -> List
         freshness = max(0.0, 1 - age / freshness_horizon)
         test_score = {0: 1.0, 1: 0.92, 2: 0.72, 3: 0.45}.get(tests, 0)
         narrow = max(0.0, 1 - width/max(volatility*1.8, 1e-9))
-        reaction = rejection_strength(candles[i+1], side) if i+1 < len(candles) else 0
+        # The pivot is only confirmed after the right-hand bars have printed.
+        # Score reaction on the first post-confirmation candle, not the pivot candle.
+        reaction_index = min(i + 4, len(candles) - 1)
+        reaction = rejection_strength(candles[reaction_index], side) if reaction_index > i else 0
         score = 100*(0.38*impulse_score + 0.22*freshness +
                      0.22*test_score + 0.10*narrow + 0.08*reaction)
         distance = abs(current-mid)
@@ -674,6 +681,7 @@ def build_zones(candles: List[dict], current: float, side: str, tf: str) -> List
             "side": side, "timeframe": tf, "low": round(lo, 5),
             "high": round(hi, 5), "mid": round(mid, 5),
             "score": round(score, 1), "age_candles": age, "tests": tests,
+            "source_atr": round(volatility, 5),
             "impulse_strength": round(impulse_score, 3),
             "reaction_strength": reaction, "distance": round(distance, 5),
             "distance_atr": round(distance/volatility, 2),
@@ -684,22 +692,26 @@ def build_zones(candles: List[dict], current: float, side: str, tf: str) -> List
 
 
 def combine_zone_confluence(zones: List[dict]) -> List[dict]:
+    """Combine only materially overlapping zones without widening their geometry."""
     ranked = sorted(zones, key=lambda z: (-z["score"], z["distance"]))
     kept = []
     for zone in ranked:
-        match = next((x for x in kept if
-                      max(zone["low"], x["low"]) <= min(zone["high"], x["high"]) +
-                      max(zone["high"]-zone["low"], x["high"]-x["low"])*0.20), None)
+        match = None
+        for candidate in kept:
+            overlap = min(zone["high"], candidate["high"]) - max(zone["low"], candidate["low"])
+            smaller_width = min(zone["high"] - zone["low"], candidate["high"] - candidate["low"])
+            if smaller_width > 0 and overlap / smaller_width >= 0.35:
+                match = candidate
+                break
         if match:
             tfs = set(match["timeframes"])
             is_new_timeframe = zone["timeframe"] not in tfs
             tfs.add(zone["timeframe"])
             match["timeframes"] = sorted(tfs)
-            match["score"] = round(min(98, max(match["score"], zone["score"]) +
-                                       (2 if is_new_timeframe else 0)), 1)
-            match["low"] = round(min(match["low"], zone["low"]), 5)
-            match["high"] = round(max(match["high"], zone["high"]), 5)
-            match["mid"] = round((match["low"] + match["high"]) / 2, 5)
+            match["score"] = round(min(98.0, max(match["score"], zone["score"]) +
+                                       (2.0 if is_new_timeframe else 0.0)), 1)
+            # Preserve the best-ranked zone's bounds. Do not create an artificial
+            # oversized union zone from two merely nearby institutional areas.
         else:
             kept.append({
                 "side": zone["side"], "low": zone["low"], "high": zone["high"],
@@ -710,6 +722,7 @@ def combine_zone_confluence(zones: List[dict]) -> List[dict]:
                 "age_candles": zone["age_candles"], "tests": zone["tests"],
                 "impulse_strength": zone["impulse_strength"],
                 "reaction_strength": zone["reaction_strength"],
+                "source_atr": zone.get("source_atr"),
                 "status": zone["status"]
             })
     return sorted(kept, key=lambda z: (z["distance"], -z["score"]))
@@ -756,53 +769,74 @@ def displacement_score(candles: List[dict], volatility: float, side: str) -> flo
 
 
 def confirmation_evidence(candles: List[dict], zone: dict, side: str,
-                          volatility: float, liquidity: dict) -> dict:
-    """Evaluate touch, rejection, displacement and structure separately."""
+                          volatility: float, liquidity: dict,
+                          directional_bias: str = "NEUTRAL") -> dict:
+    """Separate reversal evidence from trend-continuation evidence."""
     recent = candles[-5:]
     touch_offsets = [i for i, c in enumerate(recent)
                      if c["low"] <= zone["high"] and c["high"] >= zone["low"]]
     touched = bool(touch_offsets)
     bars_since_touch = (len(recent) - 1 - touch_offsets[-1]) if touched else None
     last = candles[-1]
-    # Evaluate rejection from the latest actual zone interaction, rather than
-    # requiring the final displacement candle itself to have a rejection wick.
     reaction_window = recent[touch_offsets[-1]:] if touched else [last]
     rejection = max(rejection_strength(c, side) for c in reaction_window)
     disp = displacement_score(candles, volatility, side)
-    structure = structure_summary(candles)
     expected_bos = "BULLISH_BOS" if side == "BUY" else "BEARISH_BOS"
     expected_choch = "BULLISH_CHOCH" if side == "BUY" else "BEARISH_CHOCH"
-    # Accept a genuine break event within the last three candles. Recompute
-    # each endpoint so a BOS from many candles ago cannot masquerade as fresh.
+    # Re-evaluate recent endpoints so stale structural breaks cannot be reused.
     recent_structure = [(end, structure_summary(candles[:end]))
                         for end in range(max(2, len(candles)-2), len(candles)+1)]
-    event_matches = [(end, item) for end, item in recent_structure
-                     if item.get("bos") == expected_bos or
-                     item.get("choch") == expected_choch]
-    bos_confirmed = bool(event_matches)
+    bos_events = [(end, item) for end, item in recent_structure if item.get("bos") == expected_bos]
+    choch_events = [(end, item) for end, item in recent_structure if item.get("choch") == expected_choch]
+    bos_confirmed = bool(bos_events)
+    choch_confirmed = bool(choch_events)
+    event_matches = choch_events or bos_events
     recent_event_end, recent_event = event_matches[-1] if event_matches else (None, {})
     sweep = liquidity.get("recent_sweep") or {}
     expected_sweep = "SELL_SIDE_SWEPT" if side == "BUY" else "BUY_SIDE_SWEPT"
     sweep_confirmed = sweep.get("side") == expected_sweep
-    # Confirmation is deliberately stricter than simply touching a zone.
+    rejection_ok = rejection >= 0.55
+    displacement_ok = disp >= 0.55
+    bias_aligned = directional_bias == ("BULLISH" if side == "BUY" else "BEARISH")
+
+    # Reversal: liquidity raid + reclaim/CHoCH + displacement from a tested zone.
+    reversal_confirmed = bool(touched and rejection_ok and displacement_ok and
+                              sweep_confirmed and choch_confirmed)
+    # Continuation: higher-timeframe direction + fresh BOS + retest/rejection/displacement.
+    continuation_confirmed = bool(touched and rejection_ok and displacement_ok and
+                                  bos_confirmed and bias_aligned)
     checks = {
-        "zone_touched_recently": bool(touched),
-        "rejection_candle": bool(rejection >= 0.55),
-        "directional_displacement": bool(disp >= 0.55),
-        "structure_shift": bool(bos_confirmed),
-        "liquidity_sweep": bool(sweep_confirmed)
+        "zone_touched_recently": touched,
+        "rejection_candle": rejection_ok,
+        "directional_displacement": displacement_ok,
+        "fresh_bos": bos_confirmed,
+        "fresh_choch": choch_confirmed,
+        "liquidity_sweep": sweep_confirmed,
+        "higher_timeframe_alignment": bias_aligned
     }
-    score = sum(checks.values()) / len(checks)
+    weights = {
+        "zone_touched_recently": 0.10, "rejection_candle": 0.15,
+        "directional_displacement": 0.15, "fresh_bos": 0.15,
+        "fresh_choch": 0.15, "liquidity_sweep": 0.15,
+        "higher_timeframe_alignment": 0.15
+    }
+    score = sum(weights[k] for k, passed in checks.items() if passed)
+    setup_type = "REVERSAL" if reversal_confirmed else (
+        "CONTINUATION" if continuation_confirmed else "UNCONFIRMED")
     return {
         "checks": checks,
         "confirmation_score": round(score, 2),
+        "score_note": "Technical evidence score only; not a win probability.",
         "rejection_strength": rejection,
         "displacement_strength": disp,
         "bars_since_last_zone_touch": bars_since_touch,
         "structure_event": recent_event.get("bos") or recent_event.get("choch"),
         "structure_event_age_candles": (len(candles) - recent_event_end) if recent_event_end else None,
         "recent_liquidity_sweep": sweep if sweep else None,
-        "confirmed": bool(touched and rejection >= 0.55 and disp >= 0.55 and bos_confirmed)
+        "setup_type": setup_type,
+        "reversal_confirmed": reversal_confirmed,
+        "continuation_confirmed": continuation_confirmed,
+        "confirmed": reversal_confirmed or continuation_confirmed
     }
 
 
@@ -852,22 +886,24 @@ def make_trade_plan(zone: Optional[dict], side: str, current: float,
     rr = abs(targets[0] - entry) / risk
     if rr < 1.35:
         return None
-    evidence = confirmation_evidence(primary_candles, zone, side, volatility, liquidity)
+    evidence = confirmation_evidence(primary_candles, zone, side, volatility, liquidity, directional_bias)
     current_inside = low <= current <= high
     touched = evidence["checks"]["zone_touched_recently"]
     aligned = directional_bias in ("NEUTRAL", "BULLISH" if side == "BUY" else "BEARISH")
     if data_blocked:
         status = "DATA_REVIEW_REQUIRED"
-    elif not aligned:
-        status = "COUNTER_TREND_WAIT_FOR_STRONG_CONFIRMATION"
     elif not touched:
         status = "WAITING_FOR_ZONE"
     elif not evidence["confirmed"]:
         status = "WAITING_FOR_CONFIRMATION"
+    elif not aligned and not evidence["reversal_confirmed"]:
+        status = "COUNTER_TREND_BLOCKED_NO_REVERSAL_PROOF"
     else:
         status = "CONFIRMED_CONDITIONALLY_NOT_AUTO_EXECUTABLE"
     return {
         "side": side,
+        "setup_type": evidence["setup_type"],
+        "entry_label": "المنقطع",
         "entry_zone": {"low": low, "high": high},
         "entry_reference": entry,
         "distance_from_current": round(abs(current-entry), 5),
@@ -890,7 +926,9 @@ def make_trade_plan(zone: Optional[dict], side: str, current: float,
             "directional_alignment": aligned,
             "confirmation": evidence
         },
-        "confirmation_required": "انتظر لمس المنطقة ثم رفضًا سعريًا وإزاحة واضحة وكسرًا هيكليًا حديثًا على فريم التنفيذ؛ سحب السيولة دليل إضافي قوي وليس شرطًا مطلقًا لكل حركة.",
+        "confirmation_required": ("انعكاس: سحب سيولة ثم CHoCH حديث ورفض وإزاحة من المنطقة." if evidence["setup_type"] == "REVERSAL" else
+                                   "استمرار: توافق الاتجاه الأعلى ثم BOS حديث وإعادة اختبار ورفض وإزاحة." if evidence["setup_type"] == "CONTINUATION" else
+                                   "لا تعتمد الإشارة قبل اكتمال شروط الانعكاس أو الاستمرار."),
         "setup_status": status,
         "trade_allowed_now": False,
         "invalidation": "إلغاء السيناريو عند إغلاق واضح خلف حد الإبطال؛ لا توسّع وقف الخسارة بعد الدخول.",
@@ -941,12 +979,12 @@ def build_price_path(current: float, volatility: float, structure: dict,
 
 def analyze_market(frames: Dict[str, List[dict]], quality: dict,
                    live_quote: Optional[dict] = None) -> dict:
-    primary = frames["15min"]
+                           primary = frames["15min"]
     quote_valid = bool(live_quote and live_quote.get("valid"))
     current = live_quote["price"] if quote_valid else primary[-1]["close"]
     per_tf, votes = {}, {"BULLISH": 0, "BEARISH": 0, "RANGE": 0}
     # HTF hierarchy: monthly > weekly > daily > 4h > 1h > 15m.
-    weights = {"1month": 5, "1week": 4, "1day": 3, "4h": 2, "1h": 1, "15min": 1}
+    weights = {"1month": 5, "1week": 4, "1day": 3, "4h": 2, "1h": 1, "15min": 0}
     weighted_votes = {"BULLISH": 0, "BEARISH": 0, "RANGE": 0}
     all_zones = {"BUY": [], "SELL": []}
     for tf in TIMEFRAMES:
@@ -1020,18 +1058,18 @@ def analyze_market(frames: Dict[str, List[dict]], quality: dict,
     buy_plan_zone = choose_candidate(buy_zones, "BUY")
     sell_plan_zone = choose_candidate(sell_zones, "SELL")
     blocked = quality["analysis_blocked"]
-    quote_gate_passed = quote_valid or not LIVE_QUOTE_REQUIRED
+    # Plans may be calculated from the latest completed 15m close when no valid
+    # live quote exists. This is analysis-only: make_trade_plan keeps
+    # trade_allowed_now=False and the report labels the reference price clearly.
     buy_plan = make_trade_plan(buy_plan_zone, "BUY", current, current_vol, liquidity,
-                               blocked, primary, sell_zones, bias) if quote_gate_passed else None
+                               blocked, primary, sell_zones, bias)
     sell_plan = make_trade_plan(sell_plan_zone, "SELL", current, current_vol, liquidity,
-                                blocked, primary, buy_zones, bias) if quote_gate_passed else None
+                                blocked, primary, buy_zones, bias)
 
     path = build_price_path(current, current_vol, per_tf["15min"]["structure"],
                             liquidity, buy_zones, sell_zones)
     if blocked:
         decision = "DATA_INVALID"
-    elif not quote_gate_passed:
-        decision = "NO_TRADE_LIVE_PRICE_UNAVAILABLE"
     elif bias == "NEUTRAL":
         decision = "WAIT_FOR_CONFIRMATION"
     elif (buy_plan and buy_plan["setup_status"] == "CONFIRMED_CONDITIONALLY_NOT_AUTO_EXECUTABLE") or (sell_plan and sell_plan["setup_status"] == "CONFIRMED_CONDITIONALLY_NOT_AUTO_EXECUTABLE"):
@@ -1043,12 +1081,16 @@ def analyze_market(frames: Dict[str, List[dict]], quality: dict,
         "engine": ENGINE_NAME, "version": VERSION, "symbol": SYMBOL,
         "decision": decision, "current_price": round(current, 5),
         "price_source": "LIVE_QUOTE" if quote_valid else "LAST_15MIN_CANDLE_CLOSE_NOT_LIVE",
-        "live_quote_required": LIVE_QUOTE_REQUIRED,
+        "price_basis_note": ("السعر المباشر المستخدم للتحليل." if quote_valid else
+                             "تم استخدام آخر إغلاق مكتمل لفريم 15 دقيقة كسعر مرجعي؛ المستويات والخطط تحليلية مشروطة وليست سعر تنفيذ مباشر."),
+        "live_quote_required": False,
         "live_quote_max_age_seconds": LIVE_QUOTE_MAX_AGE_SECONDS,
         "live_quote": live_quote or {"valid": False, "price": None, "timestamp": None,
                                       "age_seconds": None, "reason": "LIVE_QUOTE_MISSING"},
         "market": {
-            "directional_bias": bias, "timeframe_votes": votes,
+            "directional_bias": bias,
+            "bias_method": "HTF hierarchy: monthly > weekly > daily > 4h > 1h; 15m is execution/confirmation only",
+            "timeframe_votes": votes,
             "weighted_timeframe_votes": weighted_votes,
             "timeframe_weights": weights,
             "timeframe_alignment_score": weighted_alignment,
@@ -1092,8 +1134,8 @@ def format_plan(name: str, plan: Optional[dict]) -> List[str]:
         return [f"{name}: لا توجد خطة مستوفية لشروط المحرك حاليًا."]
     zone = plan["entry_zone"]
     lines = [
-        f"{name}:",
-        f"- منطقة الدخول: {fmt_price(zone['low'])} إلى {fmt_price(zone['high'])}",
+        f"{name} ({'انعكاس' if plan.get('setup_type') == 'REVERSAL' else 'استمرار' if plan.get('setup_type') == 'CONTINUATION' else 'غير مكتمل'}):",
+        f"- المنقطع: من {fmt_price(zone['low'])} إلى {fmt_price(zone['high'])}",
         f"- السعر المرجعي: {fmt_price(plan['entry_reference'])}",
         f"- البعد عن السعر الحالي: {plan['distance_atr']} ATR",
         f"- وقف الخسارة: {fmt_price(plan['stop_loss'])}",
@@ -1102,7 +1144,7 @@ def format_plan(name: str, plan: Optional[dict]) -> List[str]:
         f"- العائد/المخاطرة إلى الهدف الأول: {plan['first_target_rr'] if plan['first_target_rr'] is not None else 'غير متاح'}",
         f"- الحالة: {plan['setup_status']}",
         f"- تقييم المنطقة: {plan['zone_score']}/100 | الفريمات: {','.join(plan['zone_timeframes'])}",
-        f"- أدلة التأكيد: {plan.get('entry_basis', {}).get('confirmation', {}).get('checks', {})}",
+        f"- تقييم الأدلة الفنية: {plan.get('entry_basis', {}).get('confirmation', {}).get('confirmation_score', 0)} (ليس احتمال نجاح)",
         f"- التفعيل: {plan['confirmation_required']}",
         f"- الإبطال: {plan['invalidation']}"
     ]
@@ -1110,23 +1152,56 @@ def format_plan(name: str, plan: Optional[dict]) -> List[str]:
 
 
 def build_telegram_report(result: dict) -> str:
+    """Render a Telegram-safe Arabic report (no raw dicts/enums/None values)."""
     market = result["market"]
     quality = result["data_validation"]
     path = result["price_path"]
+    decision_labels = {
+        "DATA_INVALID": "توقف — بيانات غير صالحة",
+        "WAIT_FOR_CONFIRMATION": "انتظار تأكيد",
+        "CONDITIONAL_SETUP_CONFIRMED": "إعداد مشروط مكتمل — ليس تنفيذًا تلقائيًا",
+        "WAIT_FOR_SETUP": "انتظار تكوّن الإعداد",
+    }
+    direction_labels = {"BULLISH": "صاعد", "BEARISH": "هابط", "RANGE": "عرضي"}
+
+    def votes_text(votes: dict) -> str:
+        return " | ".join(
+            f"{direction_labels.get(k, k)}: {v}"
+            for k, v in (("BULLISH", votes.get("BULLISH", 0)),
+                         ("BEARISH", votes.get("BEARISH", 0)),
+                         ("RANGE", votes.get("RANGE", 0)))
+        )
+
+    def path_text(items: list) -> str:
+        if not items:
+            return "لا توجد مستويات مستهدفة مرصودة حاليًا."
+        rendered = []
+        for item in items:
+            if "level" in item:
+                reason = item.get("reason", "مستوى سيولة مرصود")
+                reason_ar = "سيولة بيع مرصودة" if "sell_side" in reason else "مستوى مرصود"
+                rendered.append(f"{fmt_price(item['level'])} ({reason_ar})")
+            elif "zone" in item and len(item["zone"]) == 2:
+                rendered.append(f"منطقة {fmt_price(item['zone'][0])}–{fmt_price(item['zone'][1])}")
+        return " ← ".join(rendered) if rendered else "لا توجد مستويات مستهدفة مرصودة حاليًا."
+
+    decision = decision_labels.get(result.get("decision"), "قيد الانتظار")
+    votes = market.get("timeframe_votes", {})
+    weighted = market.get("weighted_timeframe_votes", {})
     lines = [
         f"📊 {ENGINE_NAME} | {SYMBOL} | v{VERSION}",
-        f"السعر المرجعي: {fmt_price(result['current_price'])} ({'سعر مباشر' if result.get('price_source') == 'LIVE_QUOTE' else 'آخر إغلاق 15 دقيقة - ليس سعرًا مباشرًا'})",
-        f"القرار: {result['decision']}",
-        f"الاتجاه العام: {market['directional_bias']} | توافق الفريمات: {market['timeframe_alignment_score']}",
-        f"تصويت الفريمات: {market['timeframe_votes']}",
-        f"التصويت الموزون HTF: {market.get('weighted_timeframe_votes', {})}",
+        f"السعر المرجعي: {fmt_price(result['current_price'])} ({'سعر مباشر' if result.get('price_source') == 'LIVE_QUOTE' else 'آخر إغلاق 15 دقيقة — ليس سعرًا مباشرًا'})",
+        f"القرار: {decision}",
+        f"الاتجاه العام: {direction_labels.get(market['directional_bias'], market['directional_bias'])} | توافق الفريمات: {market['timeframe_alignment_score']}",
+        f"تصويت الفريمات: {votes_text(votes)}",
+        f"التصويت الموزون HTF: {votes_text(weighted)}",
         f"سلامة البيانات: {quality['status']}"
     ]
-    if result.get("live_quote_required") and not result.get("live_quote", {}).get("valid"):
-        lines.append("⛔ لا توجد صفقة: السعر المباشر مفقود أو غير صالح أو قديم؛ أرسل live_quote بسعر وتوقيت حديثين.")
-    if quality["blockers"]:
+    if result.get("price_source") != "LIVE_QUOTE":
+        lines.append("ℹ️ تم بناء التحليل على آخر إغلاق مكتمل لفريم 15 دقيقة؛ راجع السعر الحالي قبل أي قرار، فالأسعار المرجعية قد تكون تغيّرت.")
+    if quality.get("blockers"):
         lines.append("⛔ موانع التحليل: " + "؛ ".join(quality["blockers"][:8]))
-    if quality["warnings"]:
+    if quality.get("warnings"):
         lines.append("⚠️ تحذيرات البيانات: " + "؛ ".join(quality["warnings"][:8]))
     lines.extend(["", "📍 أقرب مناطق الانعكاس"])
     for side, label in (("buy", "شراء"), ("sell", "بيع")):
@@ -1134,29 +1209,31 @@ def build_telegram_report(result: dict) -> str:
         lines.append(f"{label}:")
         for zone in group["nearest"][:3]:
             lines.append(
-                f"- {fmt_price(zone['low'])}–{fmt_price(zone['high'])} | قوة {zone['score']}/100 "
-                f"| بُعد {zone['distance_atr']} ATR | {zone['strength_label']} | {','.join(zone['timeframes'])}"
+                f"- {fmt_price(zone['low'])}–{fmt_price(zone['high'])} | القوة {zone['score']}/100 "
+                f"| البُعد {zone['distance_atr']} ATR | {zone['strength_label']} | {','.join(zone['timeframes'])}"
             )
         if not group["nearest"]:
-            lines.append("- لا توجد منطقة صالحة مكتشفة.")
+            lines.append("- لا توجد منطقة قريبة مستوفية للشروط.")
         lines.append(f"مناطق قوية بعيدة: {len(group['strong_distant'])}")
     lines.extend(["", "🎯 خطط التداول المشروطة"])
     lines.extend(format_plan("خطة شراء", result["entry_analysis"]["buy_plan"]))
     lines.extend(format_plan("خطة بيع", result["entry_analysis"]["sell_plan"]))
+    bull = path["bullish_scenario"]
+    bear = path["bearish_scenario"]
     lines.extend([
         "", "🧭 السيناريو الصاعد",
-        f"- شرط التفعيل: {path['bullish_scenario']['trigger']}",
-        f"- المسار المحتمل: {path['bullish_scenario']['possible_path']}",
-        f"- الإبطال: {path['bullish_scenario']['invalidation']}",
+        "- شرط التفعيل: تحوّل هيكلي صاعد على 15 دقيقة أو الساعة، ثم إغلاق فوق أقرب قمة محلية مؤكدة.",
+        f"- المسار المحتمل: {path_text(bull['possible_path'])}",
+        "- الإبطال: إغلاق حاسم أسفل آخر قاع مؤكد على 15 دقيقة.",
         "", "🧭 السيناريو الهابط",
-        f"- شرط التفعيل: {path['bearish_scenario']['trigger']}",
-        f"- المسار المحتمل: {path['bearish_scenario']['possible_path']}",
-        f"- الإبطال: {path['bearish_scenario']['invalidation']}",
+        "- شرط التفعيل: تحوّل هيكلي هابط على 15 دقيقة أو الساعة، ثم إغلاق أسفل أقرب قاع محلي مؤكد.",
+        f"- المسار المحتمل: {path_text(bear['possible_path'])}",
+        "- الإبطال: إغلاق حاسم أعلى آخر قمة مؤكدة على 15 دقيقة.",
         "", "💧 السيولة",
         f"- أقرب سيولة أعلى: {fmt_price(result['liquidity']['nearest_above']['price']) if result['liquidity']['nearest_above'] else 'غير مرصودة'}",
         f"- أقرب سيولة أسفل: {fmt_price(result['liquidity']['nearest_below']['price']) if result['liquidity']['nearest_below'] else 'غير مرصودة'}",
-        f"- آخر سحب سيولة: {result['liquidity']['recent_sweep']}",
-        "", "تنبيه: المناطق تقديرية من بيانات الشموع وليست ضمانًا للانعكاس. لا توجد صفقة مسموح بها تلقائيًا."
+        f"- آخر سحب سيولة: {('لا يوجد سحب مؤكد حديث' if not result['liquidity'].get('recent_sweep') else 'تم رصد سحب سيولة حديث')}",
+        "", "تنبيه: التحليل وصفي وتجريبي، والمناطق ليست ضمانًا للانعكاس. لا توجد أوامر تنفيذ تلقائي."
     ])
     return "\n".join(lines)
 
