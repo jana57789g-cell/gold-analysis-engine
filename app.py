@@ -12,7 +12,7 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 __all__ = ["app"]
 
-VERSION = "7.3.0"
+VERSION = "7.4.0"
 ENGINE_NAME = "Gold Analysis Engine"
 SYMBOL = "XAU/USD"
 TIMEFRAMES = ["15min", "1h", "4h", "1day", "1week", "1month"]
@@ -38,10 +38,13 @@ if CANDLE_TIMESTAMP_TYPE not in {"open", "close"}:
 # These are analytical filters, not calibrated probabilities or execution advice.
 MAX_PLAN_DISTANCE_ATR = float(os.getenv("MAX_PLAN_DISTANCE_ATR", "2.0"))
 MIN_PLAN_ZONE_SCORE = float(os.getenv("MIN_PLAN_ZONE_SCORE", "70"))
+MAX_MONITOR_ZONE_DISTANCE_ATR = float(os.getenv("MAX_MONITOR_ZONE_DISTANCE_ATR", "30"))
 if MAX_PLAN_DISTANCE_ATR <= 0:
     raise ValueError("MAX_PLAN_DISTANCE_ATR must be positive")
 if not 0 <= MIN_PLAN_ZONE_SCORE <= 100:
     raise ValueError("MIN_PLAN_ZONE_SCORE must be between 0 and 100")
+if MAX_MONITOR_ZONE_DISTANCE_ATR <= MAX_PLAN_DISTANCE_ATR:
+    raise ValueError("MAX_MONITOR_ZONE_DISTANCE_ATR must exceed MAX_PLAN_DISTANCE_ATR")
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("gold_analysis_engine")
@@ -588,9 +591,14 @@ def liquidity_map(candles: List[dict], current: float, volatility: float) -> dic
     tolerance = max(volatility * 0.18, current * 0.0005)
     eqh = cluster_pivots(highs, tolerance, "EQUAL_HIGHS")
     eql = cluster_pivots(lows, tolerance, "EQUAL_LOWS")
-    above = sorted([x for x in eqh if x["price"] > current], key=lambda x: x["price"])
-    below = sorted([x for x in eql if x["price"] < current],
+    # Liquidity type follows the swing structure (highs = buy-side, lows = sell-side).
+    # Nearest-above/below is separately determined strictly by current-price location.
+    above = sorted([x for x in (eqh + eql) if x["price"] > current], key=lambda x: x["price"])
+    below = sorted([x for x in (eqh + eql) if x["price"] < current],
                    key=lambda x: x["price"], reverse=True)
+    buy_side = sorted([x for x in eqh if x["price"] > current], key=lambda x: x["price"])
+    sell_side = sorted([x for x in eql if x["price"] < current],
+                       key=lambda x: x["price"], reverse=True)
     recent = candles[-3:]
     old_highs = [p["price"] for p in highs if p["index"] < len(candles)-3]
     old_lows = [p["price"] for p in lows if p["index"] < len(candles)-3]
@@ -604,11 +612,11 @@ def liquidity_map(candles: List[dict], current: float, volatility: float) -> dic
         if any(c["low"] < level and c["close"] > level for c in recent):
             sweep = {"side": "SELL_SIDE_SWEPT", "level": round(level, 5)}
     return {
-        "buy_side_liquidity": above, "sell_side_liquidity": below,
+        "buy_side_liquidity": buy_side, "sell_side_liquidity": sell_side,
         "equal_highs": eqh, "equal_lows": eql, "recent_sweep": sweep,
         "nearest_above": above[0] if above else None,
         "nearest_below": below[0] if below else None,
-        "note": "Liquidity pools are inferred from historical swing clusters; resting orders are not directly visible."
+        "note": "Equal highs identify buy-side pools and equal lows identify sell-side pools; nearest_above/below is based on price location. Resting orders are inferred, not directly visible."
     }
 
 
@@ -951,32 +959,39 @@ def make_trade_plan(zone: Optional[dict], side: str, current: float,
 def build_price_path(current: float, volatility: float, structure: dict,
                      liquidity: dict, zones_buy: List[dict],
                      zones_sell: List[dict]) -> dict:
-    upside = [p["price"] for p in liquidity["buy_side_liquidity"] if p["price"] > current]
-    downside = [p["price"] for p in liquidity["sell_side_liquidity"] if p["price"] < current]
-    for pool in liquidity.get("higher_timeframe_pools", []):
-        if pool.get("type") == "EQUAL_HIGHS" and pool["price"] > current:
-            upside.append(pool["price"])
-        elif pool.get("type") == "EQUAL_LOWS" and pool["price"] < current:
-            downside.append(pool["price"])
-    nearest_buy_zone = min(zones_buy, key=lambda z: z["distance"]) if zones_buy else None
-    nearest_sell_zone = min(zones_sell, key=lambda z: z["distance"]) if zones_sell else None
-    upside_target = min(upside) if upside else (
-        structure["swing_high"]["price"] if structure.get("swing_high") and structure["swing_high"]["price"] > current else None
-    )
-    downside_target = max(downside) if downside else (
-        structure["swing_low"]["price"] if structure.get("swing_low") and structure["swing_low"]["price"] < current else None
-    )
-    bullish_steps, bearish_steps = [], []
-    if upside_target is not None:
-        bullish_steps.append({"level": round(upside_target, 5), "reason": "nearest_observed_buy_side_liquidity"})
+    observed = list(liquidity.get("equal_highs", [])) + list(liquidity.get("equal_lows", []))
+    observed += list(liquidity.get("higher_timeframe_pools", []))
+    unique = {}
+    for pool in observed:
+        try:
+            price = float(pool["price"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if abs(price-current) <= max(volatility*30, current*0.02):
+            unique[(round(price, 5), pool.get("type"))] = {**pool, "price": price}
+    upside = sorted((p for p in unique.values() if p["price"] > current), key=lambda p:p["price"])
+    downside = sorted((p for p in unique.values() if p["price"] < current), key=lambda p:p["price"], reverse=True)
+    def relevant_zone(zones):
+        candidates = [z for z in zones if z.get("distance_atr") is not None and z["distance_atr"] <= 12]
+        return min(candidates, key=lambda z:(z["distance"], -z["score"])) if candidates else None
+    nearest_buy_zone = relevant_zone(zones_buy)
+    nearest_sell_zone = relevant_zone(zones_sell)
+    if not upside and structure.get("swing_high") and structure["swing_high"]["price"] > current:
+        upside = [{"price": structure["swing_high"]["price"], "type":"SWING_HIGH"}]
+    if not downside and structure.get("swing_low") and structure["swing_low"]["price"] < current:
+        downside = [{"price": structure["swing_low"]["price"], "type":"SWING_LOW"}]
+    bullish_steps = [{"level": round(p["price"], 5), "reason": p.get("type", "observed_liquidity"),
+                      "timeframe": p.get("timeframe")} for p in upside[:6]]
+    bearish_steps = [{"level": round(p["price"], 5), "reason": p.get("type", "observed_liquidity"),
+                      "timeframe": p.get("timeframe")} for p in downside[:6]]
     if nearest_sell_zone:
         bullish_steps.append({"zone": [nearest_sell_zone["low"], nearest_sell_zone["high"]],
                               "reason": "overhead_supply_zone_to_reclaim"})
-    if downside_target is not None:
-        bearish_steps.append({"level": round(downside_target, 5), "reason": "nearest_observed_sell_side_liquidity"})
+        bullish_steps.sort(key=lambda x: x.get("level", sum(x.get("zone", [0,0]))/2))
     if nearest_buy_zone:
         bearish_steps.append({"zone": [nearest_buy_zone["low"], nearest_buy_zone["high"]],
                               "reason": "underlying_demand_zone_to_test"})
+        bearish_steps.sort(key=lambda x: x.get("level", sum(x.get("zone", [0,0]))/2), reverse=True)
     return {
         "current_price": round(current, 5),
         "bullish_scenario": {
@@ -989,7 +1004,7 @@ def build_price_path(current: float, volatility: float, structure: dict,
             "possible_path": bearish_steps,
             "invalidation": "A decisive close above the latest confirmed 15min swing high."
         },
-        "directional_note": "These are conditional paths, not guaranteed forecasts. Levels are based only on observed candle structure and inferred liquidity."
+        "directional_note": "Conditional paths are ordered from nearest to farther levels; distant historical context is excluded from the immediate path. These are not guaranteed forecasts."
     }
 
 
@@ -1010,9 +1025,10 @@ def build_scenario_ladder(current: float, liquidity: dict,
         key = (price, pool.get("type"))
         unique.setdefault(key, {**pool, "price": price})
 
-    above = sorted((x for x in unique.values() if x["price"] > current),
+    max_context_distance = max(float(per_tf.get("15min", {}).get("atr") or 0) * 30, current * 0.02)
+    above = sorted((x for x in unique.values() if current < x["price"] <= current + max_context_distance),
                    key=lambda x: x["price"])[:6]
-    below = sorted((x for x in unique.values() if x["price"] < current),
+    below = sorted((x for x in unique.values() if current - max_context_distance <= x["price"] < current),
                    key=lambda x: x["price"], reverse=True)[:6]
 
     def zone_view(zones: List[dict]) -> List[dict]:
@@ -1147,10 +1163,18 @@ def analyze_market(frames: Dict[str, List[dict]], quality: dict,
         if tf not in per_tf:
             continue
         tf_liq = liquidity_map(frames[tf], current, atr(frames[tf]))
-        for key in ("buy_side_liquidity", "sell_side_liquidity"):
+        for key in ("equal_highs", "equal_lows"):
             for pool in tf_liq[key]:
                 htf_pools.append({**pool, "timeframe": tf})
-    liquidity["higher_timeframe_pools"] = htf_pools[:60]
+    liquidity["higher_timeframe_pools"] = htf_pools[:120]
+    htf_above = sorted((p for p in htf_pools if p["price"] > current), key=lambda p:p["price"])
+    htf_below = sorted((p for p in htf_pools if p["price"] < current), key=lambda p:p["price"], reverse=True)
+    local_above = liquidity.get("nearest_above")
+    local_below = liquidity.get("nearest_below")
+    above_candidates = ([local_above] if local_above else []) + htf_above
+    below_candidates = ([local_below] if local_below else []) + htf_below
+    liquidity["nearest_above"] = min(above_candidates, key=lambda p:p["price"]) if above_candidates else None
+    liquidity["nearest_below"] = max(below_candidates, key=lambda p:p["price"]) if below_candidates else None
 
     buy_zones = combine_zone_confluence(all_zones["BUY"])
     sell_zones = combine_zone_confluence(all_zones["SELL"])
@@ -1166,6 +1190,12 @@ def analyze_market(frames: Dict[str, List[dict]], quality: dict,
 
     buy_zones = [z for z in buy_zones if z.get("width_atr") is not None and z["width_atr"] <= 2.2]
     sell_zones = [z for z in sell_zones if z.get("width_atr") is not None and z["width_atr"] <= 2.2]
+    rejected_extreme_zones = {
+        "buy": sum(1 for z in buy_zones if z.get("distance_atr", 1e99) > MAX_MONITOR_ZONE_DISTANCE_ATR),
+        "sell": sum(1 for z in sell_zones if z.get("distance_atr", 1e99) > MAX_MONITOR_ZONE_DISTANCE_ATR)
+    }
+    buy_zones = [z for z in buy_zones if z.get("distance_atr") is not None and z["distance_atr"] <= MAX_MONITOR_ZONE_DISTANCE_ATR]
+    sell_zones = [z for z in sell_zones if z.get("distance_atr") is not None and z["distance_atr"] <= MAX_MONITOR_ZONE_DISTANCE_ATR]
     buy_zones.sort(key=lambda z: (-z["score"], z["distance"]))
     sell_zones.sort(key=lambda z: (-z["score"], z["distance"]))
     buy_groups = zone_collections(sorted(buy_zones, key=lambda z: (z["distance"], -z["score"])), current_vol)
@@ -1240,7 +1270,9 @@ def analyze_market(frames: Dict[str, List[dict]], quality: dict,
             "all_sell_zones": sorted(sell_zones, key=lambda z: (-z["score"], z["distance"]))[:30]
         },
         "scenario_ladder": build_scenario_ladder(current, liquidity, buy_zones, sell_zones, per_tf, path),
-        "screening_summary": build_screening_summary(current, current_vol, buy_zones, sell_zones),
+        "screening_summary": {**build_screening_summary(current, current_vol, buy_zones, sell_zones),
+                              "max_monitor_zone_distance_atr": MAX_MONITOR_ZONE_DISTANCE_ATR,
+                              "rejected_extreme_zone_count": rejected_extreme_zones},
         "entry_analysis": {
             "buy_plan": buy_plan, "sell_plan": sell_plan,
             "best_plan": best_plan,
@@ -1461,6 +1493,7 @@ def health():
         "live_quote_required": LIVE_QUOTE_REQUIRED,
         "live_quote_max_age_seconds": LIVE_QUOTE_MAX_AGE_SECONDS,
         "max_plan_distance_atr": MAX_PLAN_DISTANCE_ATR,
+        "max_monitor_zone_distance_atr": MAX_MONITOR_ZONE_DISTANCE_ATR,
         "minimum_plan_zone_score": MIN_PLAN_ZONE_SCORE,
         "timestamp_policy": "epoch or timezone-offset timestamps accepted; naive timestamps use configured per-timeframe IANA timezone",
         "engine_health_monitor": "enabled",
