@@ -6,7 +6,11 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Any, Dict, List, Optional, Tuple
 
+# Vercel WSGI entrypoint: a module-level Flask instance named exactly `app`.
 from flask import Flask, request, jsonify
+
+app = Flask(__name__)
+__all__ = ["app"]
 
 VERSION = "7.0.1"
 ENGINE_NAME = "Gold Analysis Engine"
@@ -36,7 +40,6 @@ CANDLE_TIMESTAMP_TYPE = os.getenv("CANDLE_TIMESTAMP_TYPE", "open").strip().lower
 if CANDLE_TIMESTAMP_TYPE not in {"open", "close"}:
     raise ValueError("CANDLE_TIMESTAMP_TYPE must be 'open' or 'close'")
 
-app = Flask(__name__)
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("gold_analysis_engine")
 
