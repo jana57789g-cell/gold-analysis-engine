@@ -12,7 +12,7 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 __all__ = ["app"]
 
-VERSION = "7.0.1"
+VERSION = "7.1.0"
 ENGINE_NAME = "Gold Analysis Engine"
 SYMBOL = "XAU/USD"
 TIMEFRAMES = ["15min", "1h", "4h", "1day", "1week", "1month"]
@@ -28,10 +28,8 @@ if not 1 <= MIN_COMPLETE_CANDLES <= MAX_CANDLES:
     raise ValueError("MIN_COMPLETE_CANDLES must be between 1 and MAX_CANDLES")
 PREFERRED_COMPLETE_CANDLES = 30
 FUTURE_TOLERANCE_SECONDS = 60
-# A live quote is preferred, but never required for analysis-plan generation.
-# If it is missing/stale/invalid, the engine uses the latest completed 15m close
-# and labels every resulting level as a reference, not a live execution price.
-# Kept as False for backward-compatible API metadata; legacy env setting is ignored.
+# A live quote is optional. If it is missing/stale/invalid, the engine uses the
+# latest completed 15m close as a clearly labelled analytical reference price.
 LIVE_QUOTE_REQUIRED = False
 LIVE_QUOTE_MAX_AGE_SECONDS = int(os.getenv("LIVE_QUOTE_MAX_AGE_SECONDS", "180"))
 if LIVE_QUOTE_MAX_AGE_SECONDS < 1:
@@ -453,13 +451,31 @@ def data_quality_report(frames: Dict[str, List[dict]], errors: List[str],
             report[tf] = {**counts, "complete_count": 0, "latest_datetime": None,
                           "latest_close": None, "future_seconds": None,
                           "age_after_candle_close_seconds": None}
-            blockers.append(f"{tf}:no_usable_candles")
+            if tf == "15min":
+                blockers.append(f"{tf}:no_usable_candles")
+            else:
+                warnings.append(f"{tf}:no_usable_candles_excluded_from_analysis")
+                degraded = True
 
-    if errors:
-        blockers.extend(errors)
-    valid_counts = all(len(frames.get(tf, [])) >= MIN_COMPLETE_CANDLES for tf in TIMEFRAMES)
-    valid = not blockers and valid_counts
-    status = "INVALID" if not valid else "DEGRADED" if degraded else "VALID"
+    # Partial-timeframe policy: 15m is the minimum reference frame. Other
+    # timeframes may be unavailable; continue with the usable frames and expose
+    # their absence explicitly instead of silently treating them as valid.
+    primary_count = len(frames.get("15min", []))
+    if primary_count < MIN_COMPLETE_CANDLES:
+        blockers.append(f"15min:insufficient_primary_candles:{primary_count}<{MIN_COMPLETE_CANDLES}")
+    for tf in TIMEFRAMES:
+        count = len(frames.get(tf, []))
+        if count < MIN_COMPLETE_CANDLES and tf != "15min":
+            warnings.append(f"{tf}:excluded_from_analysis_insufficient_candles:{count}<{MIN_COMPLETE_CANDLES}")
+            degraded = True
+    # Row-level defects are retained in diagnostics. They do not invalidate
+    # otherwise sufficient completed candles; the affected rows were excluded.
+    for err in errors:
+        warnings.append("input_issue_reviewed:" + err)
+        degraded = True
+    valid = primary_count >= MIN_COMPLETE_CANDLES
+    status = "INVALID" if not valid else "DEGRADED" if degraded or warnings else "VALID"
+    available = [tf for tf in TIMEFRAMES if len(frames.get(tf, [])) >= MIN_COMPLETE_CANDLES]
     return {
         "status": status,
         "analysis_blocked": not valid,
@@ -471,9 +487,19 @@ def data_quality_report(frames: Dict[str, List[dict]], errors: List[str],
         "live_quote_required": LIVE_QUOTE_REQUIRED,
         "live_quote_max_age_seconds": LIVE_QUOTE_MAX_AGE_SECONDS,
         "timeframes": report,
+        "available_timeframes": available,
+        "excluded_timeframes": [tf for tf in TIMEFRAMES if tf not in available],
         "errors": errors,
-        "warnings": warnings,
+        "warnings": list(dict.fromkeys(warnings)),
         "blockers": blockers,
+        "engine_health": {
+            "status": "DEGRADED" if valid and (degraded or warnings) else "HEALTHY" if valid else "BLOCKED",
+            "usable_timeframes": len(available),
+            "expected_timeframes": len(TIMEFRAMES),
+            "primary_reference_available": primary_count >= MIN_COMPLETE_CANDLES,
+            "policy": "continue_with_valid_timeframes; 15min_reference_required",
+            "data_mutation_performed": False
+        },
         "normalization_notes": notes,
         "self_healing": {
             "applied": ["explicit-offset/epoch UTC conversion", "chronological sorting before latest-candle selection", "safe numeric parsing", "calendar-aware monthly candle boundaries"],
@@ -991,7 +1017,9 @@ def analyze_market(frames: Dict[str, List[dict]], quality: dict,
     weighted_votes = {"BULLISH": 0, "BEARISH": 0, "RANGE": 0}
     all_zones = {"BUY": [], "SELL": []}
     for tf in TIMEFRAMES:
-        candles = frames[tf]
+        candles = frames.get(tf, [])
+        if len(candles) < MIN_COMPLETE_CANDLES:
+            continue
         structure = structure_summary(candles)
         volatility = atr(candles)
         weight = weights[tf]
@@ -1010,15 +1038,18 @@ def analyze_market(frames: Dict[str, List[dict]], quality: dict,
             all_zones[side].extend(build_zones(candles, current, side, tf))
 
     current_vol = atr(primary)
-    total_weight = sum(weights.values())
+    available_weights = {tf: weights[tf] for tf in per_tf}
+    total_weight = sum(available_weights.values())
     winning_bias = max(weighted_votes, key=weighted_votes.get)
-    weighted_alignment = round(weighted_votes[winning_bias] / total_weight, 3)
+    weighted_alignment = round(weighted_votes[winning_bias] / total_weight, 3) if total_weight else 0.0
     # Require a clear weighted majority; otherwise preserve neutral state.
     bias = winning_bias if weighted_alignment >= 0.52 else "NEUTRAL"
     liquidity = liquidity_map(primary, current, current_vol)
     # Add higher-timeframe liquidity pools as context, preserving source TF.
     htf_pools = []
     for tf in ("1h", "4h", "1day", "1week"):
+        if tf not in per_tf:
+            continue
         tf_liq = liquidity_map(frames[tf], current, atr(frames[tf]))
         for key in ("buy_side_liquidity", "sell_side_liquidity"):
             for pool in tf_liq[key]:
@@ -1045,38 +1076,17 @@ def analyze_market(frames: Dict[str, List[dict]], quality: dict,
     buy_groups = zone_collections(sorted(buy_zones, key=lambda z: (z["distance"], -z["score"])), current_vol)
     sell_groups = zone_collections(sorted(sell_zones, key=lambda z: (z["distance"], -z["score"])), current_vol)
 
-    # Candidate selection balances quality, confluence, distance and HTF alignment.
-    def choose_candidate(zones: List[dict], side: str) -> Optional[dict]:
-        candidates = []
-        expected_bias = "BULLISH" if side == "BUY" else "BEARISH"
-        for z in zones:
-            if z["score"] < 65 or z["distance_atr"] is None or z["distance_atr"] > 4.0:
-                continue
-            alignment_bonus = 8 if bias == expected_bias else 0 if bias == "NEUTRAL" else -10
-            proximity_penalty = min(12, z["distance_atr"] * 2.0)
-            rank = z["score"] + alignment_bonus - proximity_penalty
-            candidates.append((rank, z))
-        return max(candidates, key=lambda x: x[0])[1] if candidates else None
-
-    buy_plan_zone = choose_candidate(buy_zones, "BUY")
-    sell_plan_zone = choose_candidate(sell_zones, "SELL")
-    blocked = quality["analysis_blocked"]
-    # Plans may be calculated from the latest completed 15m close when no valid
-    # live quote exists. This is analysis-only: make_trade_plan keeps
-    # trade_allowed_now=False and the report labels the reference price clearly.
-    buy_plan = make_trade_plan(buy_plan_zone, "BUY", current, current_vol, liquidity,
-                               blocked, primary, sell_zones, bias)
-    sell_plan = make_trade_plan(sell_plan_zone, "SELL", current, current_vol, liquidity,
-                                blocked, primary, buy_zones, bias)
+    # This API intentionally exposes descriptive zones/scenarios only.
+    # It does not generate executable trade plans or order parameters.
+    buy_plan = None
+    sell_plan = None
 
     path = build_price_path(current, current_vol, per_tf["15min"]["structure"],
                             liquidity, buy_zones, sell_zones)
-    if blocked:
+    if quality["analysis_blocked"]:
         decision = "DATA_INVALID"
     elif bias == "NEUTRAL":
         decision = "WAIT_FOR_CONFIRMATION"
-    elif (buy_plan and buy_plan["setup_status"] == "CONFIRMED_CONDITIONALLY_NOT_AUTO_EXECUTABLE") or (sell_plan and sell_plan["setup_status"] == "CONFIRMED_CONDITIONALLY_NOT_AUTO_EXECUTABLE"):
-        decision = "CONDITIONAL_SETUP_CONFIRMED"
     else:
         decision = "WAIT_FOR_SETUP"
 
@@ -1100,14 +1110,7 @@ def analyze_market(frames: Dict[str, List[dict]], quality: dict,
             "confidence_note": "Alignment score measures weighted rule agreement; it is not a win probability or calibrated forecast."
         },
         "timeframe_analysis": per_tf,
-        "market_structure": {
-            "15min": per_tf["15min"]["structure"],
-            "1h": per_tf["1h"]["structure"],
-            "4h": per_tf["4h"]["structure"],
-            "1day": per_tf["1day"]["structure"],
-            "1week": per_tf["1week"]["structure"],
-            "1month": per_tf["1month"]["structure"]
-        },
+        "market_structure": {tf: item["structure"] for tf, item in per_tf.items()},
         "liquidity": liquidity,
         "reversal_zones": {
             "buy": buy_groups, "sell": sell_groups,
@@ -1116,7 +1119,7 @@ def analyze_market(frames: Dict[str, List[dict]], quality: dict,
         },
         "entry_analysis": {
             "buy_plan": buy_plan, "sell_plan": sell_plan,
-            "note": "A zone is not an entry signal. Require zone interaction, rejection, displacement and structure confirmation. Plans are conditional and never auto-executed."
+            "note": "Descriptive market zones and scenarios only. Executable buy/sell plans, entry orders, stop-losses and trade targets are not generated."
         },
         "price_path": path,
         "data_validation": quality,
@@ -1202,8 +1205,12 @@ def build_telegram_report(result: dict) -> str:
     ]
     if result.get("price_source") != "LIVE_QUOTE":
         lines.append("ℹ️ تم بناء التحليل على آخر إغلاق مكتمل لفريم 15 دقيقة؛ راجع السعر الحالي قبل أي قرار، فالأسعار المرجعية قد تكون تغيّرت.")
+    health = quality.get("engine_health", {})
+    lines.append(f"سلامة المحرك: {health.get('status', 'غير معروف')} | الفريمات المستخدمة: {health.get('usable_timeframes', 0)}/{health.get('expected_timeframes', len(TIMEFRAMES))}")
+    if quality.get("excluded_timeframes"):
+        lines.append("⚠️ فريمات مستبعدة: " + ", ".join(quality["excluded_timeframes"]))
     if quality.get("blockers"):
-        lines.append("⛔ موانع التحليل: " + "؛ ".join(quality["blockers"][:8]))
+        lines.append("⛔ سبب تعذر التحليل: " + "؛ ".join(quality["blockers"][:8]))
     if quality.get("warnings"):
         lines.append("⚠️ تحذيرات البيانات: " + "؛ ".join(quality["warnings"][:8]))
     lines.extend(["", "📍 أقرب مناطق الانعكاس"])
@@ -1218,9 +1225,8 @@ def build_telegram_report(result: dict) -> str:
         if not group["nearest"]:
             lines.append("- لا توجد منطقة قريبة مستوفية للشروط.")
         lines.append(f"مناطق قوية بعيدة: {len(group['strong_distant'])}")
-    lines.extend(["", "🎯 خطط التداول المشروطة"])
-    lines.extend(format_plan("خطة شراء", result["entry_analysis"]["buy_plan"]))
-    lines.extend(format_plan("خطة بيع", result["entry_analysis"]["sell_plan"]))
+    lines.extend(["", "📌 المناطق الوصفية"])
+    lines.append("- المناطق المعروضة مستويات تحليلية وليست أوامر دخول أو توصيات شراء/بيع.")
     bull = path["bullish_scenario"]
     bear = path["bearish_scenario"]
     lines.extend([
@@ -1261,7 +1267,9 @@ def health():
         "candle_timestamp_type": CANDLE_TIMESTAMP_TYPE,
         "live_quote_required": LIVE_QUOTE_REQUIRED,
         "live_quote_max_age_seconds": LIVE_QUOTE_MAX_AGE_SECONDS,
-        "timestamp_policy": "epoch or timezone-offset timestamps accepted; naive timestamps use the documented per-timeframe XAU/USD source timezone unless explicitly overridden"
+        "timestamp_policy": "epoch or timezone-offset timestamps accepted; naive timestamps use the documented per-timeframe XAU/USD source timezone unless explicitly overridden",
+        "engine_health_monitor": "enabled",
+        "partial_timeframe_policy": "15min reference required; other timeframes may be excluded with warnings"
     })
 
 
