@@ -12,7 +12,7 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 __all__ = ["app"]
 
-VERSION = "7.5.0"
+VERSION = "7.6.0"
 ENGINE_NAME = "Gold Analysis Engine"
 SYMBOL = "XAU/USD"
 TIMEFRAMES = ["15min", "1h", "4h", "1day", "1week", "1month"]
@@ -552,8 +552,43 @@ def structure_summary(candles: List[dict]) -> dict:
            "BEARISH_BOS" if crossed_down and not crossed_up else None)
     choch = ("BULLISH_CHOCH" if direction == "BEARISH" and bos == "BULLISH_BOS" else
              "BEARISH_CHOCH" if direction == "BULLISH" and bos == "BEARISH_BOS" else None)
+    # Distinguish a fresh break on the latest candle from a level that was
+    # already broken earlier. This prevents a stale pivot from being mistaken
+    # for an intact barrier when price is already beyond it.
+    close_now = candles[-1]["close"] if candles else None
+    high_price = last_high["price"] if last_high else None
+    low_price = last_low["price"] if last_low else None
+    high_status = ("BROKEN_ABOVE" if close_now is not None and high_price is not None and close_now > high_price
+                   else "INTACT" if high_price is not None else "UNAVAILABLE")
+    low_status = ("BROKEN_BELOW" if close_now is not None and low_price is not None and close_now < low_price
+                  else "INTACT" if low_price is not None else "UNAVAILABLE")
+    high_break_age = None
+    low_break_age = None
+    if last_high and high_status == "BROKEN_ABOVE":
+        for j in range(len(candles)-1, last_high["index"], -1):
+            if candles[j]["close"] > high_price and candles[j-1]["close"] <= high_price:
+                high_break_age = len(candles) - 1 - j
+                break
+        if high_break_age is None:
+            first = next((j for j in range(last_high["index"] + 1, len(candles))
+                          if candles[j]["close"] > high_price), None)
+            high_break_age = len(candles) - 1 - first if first is not None else None
+    if last_low and low_status == "BROKEN_BELOW":
+        for j in range(len(candles)-1, last_low["index"], -1):
+            if candles[j]["close"] < low_price and candles[j-1]["close"] >= low_price:
+                low_break_age = len(candles) - 1 - j
+                break
+        if low_break_age is None:
+            first = next((j for j in range(last_low["index"] + 1, len(candles))
+                          if candles[j]["close"] < low_price), None)
+            low_break_age = len(candles) - 1 - first if first is not None else None
     return {
         "direction": direction, "bos": bos, "choch": choch,
+        "swing_high_status": high_status, "swing_low_status": low_status,
+        "swing_high_break_age_candles": high_break_age,
+        "swing_low_break_age_candles": low_break_age,
+        "current_close_vs_last_swing": ("ABOVE_LAST_SWING_HIGH" if high_status == "BROKEN_ABOVE" else
+                                         "BELOW_LAST_SWING_LOW" if low_status == "BROKEN_BELOW" else "INSIDE_LAST_SWINGS"),
         "swing_high": last_high, "swing_low": last_low,
         "higher_high": bool(hh), "higher_low": bool(hl),
         "lower_high": bool(lh), "lower_low": bool(ll),
@@ -618,12 +653,33 @@ def liquidity_map(candles: List[dict], current: float, volatility: float) -> dic
         level = min(old_lows[-5:])
         if any(c["low"] < level and c["close"] > level for c in recent):
             sweep = {"side": "SELL_SIDE_SWEPT", "level": round(level, 5)}
+    # Add explicit role and relative-location labels. EQH/EQL type is determined
+    # by pivot origin, not by whether the pool currently sits above/below price.
+    annotated = []
+    for pool in eqh + eql:
+        item = dict(pool)
+        item["liquidity_role"] = "BUY_SIDE_LIQUIDITY" if pool["type"] == "EQUAL_HIGHS" else "SELL_SIDE_LIQUIDITY"
+        item["location_relative_to_price"] = "ABOVE" if pool["price"] > current else "BELOW" if pool["price"] < current else "AT_PRICE"
+        item["status_relative_to_price"] = (
+            "ACTIVE_ABOVE_PRICE" if pool["type"] == "EQUAL_HIGHS" and pool["price"] > current else
+            "ACTIVE_BELOW_PRICE" if pool["type"] == "EQUAL_LOWS" and pool["price"] < current else
+            "CROSSED_OR_BEHIND_PRICE" if pool["price"] != current else "AT_REFERENCE_PRICE"
+        )
+        annotated.append(item)
+    eqh = [x for x in annotated if x["type"] == "EQUAL_HIGHS"]
+    eql = [x for x in annotated if x["type"] == "EQUAL_LOWS"]
+    buy_side = sorted([x for x in eqh if x["price"] > current], key=lambda x: x["price"])
+    sell_side = sorted([x for x in eql if x["price"] < current], key=lambda x: x["price"], reverse=True)
+    annotated_above = sorted([x for x in annotated if x["price"] > current], key=lambda x: x["price"])
+    annotated_below = sorted([x for x in annotated if x["price"] < current], key=lambda x: x["price"], reverse=True)
     return {
         "buy_side_liquidity": buy_side, "sell_side_liquidity": sell_side,
         "equal_highs": eqh, "equal_lows": eql, "recent_sweep": sweep,
-        "nearest_above": above[0] if above else None,
-        "nearest_below": below[0] if below else None,
-        "note": "Equal highs identify buy-side pools and equal lows identify sell-side pools; nearest_above/below is based on price location. Resting orders are inferred, not directly visible."
+        "nearest_above": annotated_above[0] if annotated_above else None,
+        "nearest_below": annotated_below[0] if annotated_below else None,
+        "nearest_active_buy_side": buy_side[0] if buy_side else None,
+        "nearest_active_sell_side": sell_side[0] if sell_side else None,
+        "note": "EQUAL_HIGHS تعني سيولة شراء وEQUAL_LOWS تعني سيولة بيع بحسب أصل القمم/القيعان؛ موقع المستوى من السعر حالة منفصلة. المستويات المستنتجة لا تكشف الأوامر الفعلية."
     }
 
 
@@ -1094,6 +1150,192 @@ def build_scenario_ladder(current: float, liquidity: dict,
     }
 
 
+def build_data_integrity_diagnostics(per_tf: Dict[str, dict], liquidity: dict,
+                                     current: float, price_source: str) -> dict:
+    """Explain structural and liquidity states that basic candle validation cannot catch."""
+    structural = []
+    for tf in TIMEFRAMES:
+        item = per_tf.get(tf)
+        if not item:
+            continue
+        st = item.get("structure", {})
+        if st.get("swing_high_status") == "BROKEN_ABOVE" and not st.get("bos"):
+            structural.append({
+                "timeframe": tf, "code": "PRICE_ALREADY_ABOVE_LAST_CONFIRMED_SWING_HIGH",
+                "level": (st.get("swing_high") or {}).get("price"),
+                "break_age_candles": st.get("swing_high_break_age_candles"),
+                "meaning": "السعر أغلق أعلى آخر قمة مؤكدة؛ عدم وجود BOS على آخر شمعة لا يعني أن القمة ما زالت حاجزًا غير مكسور."
+            })
+        if st.get("swing_low_status") == "BROKEN_BELOW" and not st.get("bos"):
+            structural.append({
+                "timeframe": tf, "code": "PRICE_ALREADY_BELOW_LAST_CONFIRMED_SWING_LOW",
+                "level": (st.get("swing_low") or {}).get("price"),
+                "break_age_candles": st.get("swing_low_break_age_candles"),
+                "meaning": "السعر أغلق أسفل آخر قاع مؤكد؛ عدم وجود BOS على آخر شمعة لا يعني أن القاع ما زال حاجزًا غير مكسور."
+            })
+    pools = list(liquidity.get("equal_highs", [])) + list(liquidity.get("equal_lows", []))
+    role_checks = [{
+        "price": p.get("price"), "type": p.get("type"),
+        "liquidity_role": p.get("liquidity_role"),
+        "location_relative_to_price": p.get("location_relative_to_price"),
+        "status_relative_to_price": p.get("status_relative_to_price")
+    } for p in pools]
+    conflicts = [tf for tf, item in per_tf.items()
+                 if item.get("structure_consistency", {}).get("contradiction")]
+    reference_time = (per_tf.get("15min") or {}).get("latest_candle_close_time")
+    reference_dt = parse_time(reference_time) if reference_time else None
+    snapshot = []
+    for tf in TIMEFRAMES:
+        item = per_tf.get(tf)
+        if not item:
+            snapshot.append({"timeframe": tf, "available": False})
+            continue
+        close_time = item.get("latest_candle_close_time")
+        close_dt = parse_time(close_time) if close_time else None
+        delta = (reference_dt - close_dt).total_seconds() if reference_dt and close_dt else None
+        snapshot.append({
+            "timeframe": tf, "available": True,
+            "latest_completed_candle_close": close_time,
+            "seconds_behind_15min_reference": round(max(0.0, delta), 1) if delta is not None else None,
+            "freshness_note": "فريم أعلى بطبيعته قد يكون آخر إغلاق مكتمل له أقدم من 15 دقيقة؛ يُحكم عليه أيضًا بحداثة البيانات الخاصة به."
+        })
+    return {
+        "status": "REVIEW" if structural or conflicts else "OK",
+        "structural_state_warnings": structural,
+        "structure_conflict_timeframes": conflicts,
+        "timeframe_snapshot_alignment": snapshot,
+        "liquidity_classification": role_checks,
+        "nearest_active_buy_side": liquidity.get("nearest_active_buy_side"),
+        "nearest_active_sell_side": liquidity.get("nearest_active_sell_side"),
+        "price_reference": {"price_source": price_source, "current_price": round(current, 5),
+                            "is_live_quote": price_source == "LIVE_QUOTE"},
+        "notes": [
+            "تُفصل حالة كسر القمة/القاع عن حدث BOS على آخر شمعة.",
+            "EQUAL_HIGHS/EQUAL_LOWS تصنيف بحسب أصل pivot؛ nearest_above/nearest_below وصف مكاني فقط.",
+            "لا يمكن استنتاج تزامن كل الفريمات من قيمة السعر وحدها؛ تُعرض أوقات الإغلاق وحداثة كل فريم في data_validation."
+        ]
+    }
+
+
+def build_market_scenarios(current: float, price_path: dict, ladder: dict,
+                           per_tf: Dict[str, dict], liquidity: dict,
+                           data_integrity: dict) -> dict:
+    """Standalone market-route map; deliberately independent from trade plans/entries."""
+    def level_item(pool: dict, side: str) -> dict:
+        return {
+            "price": pool.get("price"), "type": pool.get("type"),
+            "timeframe": pool.get("timeframe", "15min/local"),
+            "touches": pool.get("touches", 0),
+            "role": pool.get("liquidity_role", "BUY_SIDE_LIQUIDITY" if pool.get("type") == "EQUAL_HIGHS" else "SELL_SIDE_LIQUIDITY"),
+            "reaction_watch": "احتمال تباطؤ/رفض أو سحب سيولة؛ لا يُفترض الانعكاس دون إغلاق وتأكيد." if side == "up" else
+                             "احتمال تباطؤ/ارتداد أو سحب سيولة؛ لا يُفترض الانعكاس دون إغلاق وتأكيد."
+        }
+    def zone_item(z: dict, role: str) -> dict:
+        return {"low": z.get("low"), "high": z.get("high"), "mid": z.get("mid"),
+                "score": z.get("score"), "strength": z.get("strength_label"),
+                "timeframes": z.get("timeframes", []), "tests": z.get("tests"),
+                "distance_atr": z.get("distance_atr"), "role": role,
+                "reaction_watch": "منطقة محتملة لامتصاص/رفض السعر؛ يلزم سلوك سعري مؤكد."}
+    bull_path = price_path.get("bullish_scenario", {})
+    bear_path = price_path.get("bearish_scenario", {})
+    bull_levels = [level_item(x, "up") for x in ladder.get("upward_observed_levels", [])]
+    bear_levels = [level_item(x, "down") for x in ladder.get("downward_observed_levels", [])]
+    # Include the first contextual zones independently from execution candidates.
+    supply = [zone_item(z, "OVERHEAD_SUPPLY_OR_REACTION_AREA") for z in ladder.get("supply_zones_to_monitor", [])[:5]]
+    demand = [zone_item(z, "UNDERLYING_DEMAND_OR_REACTION_AREA") for z in ladder.get("demand_zones_to_monitor", [])[:5]]
+    def route(levels, zones, path_items):
+        ordered = []
+        for item in path_items or []:
+            if "level" in item:
+                match = next((x for x in levels if x.get("price") is not None and abs(float(x["price"])-float(item["level"])) < 1e-4), None)
+                ordered.append(match or {"price": item["level"], "type": item.get("reason"), "reaction_watch": "مستوى سعري مرصود؛ راقب التباطؤ أو الاختراق."})
+            elif "zone" in item:
+                lo, hi = item["zone"]
+                match = next((x for x in zones if x.get("low") is not None and abs(float(x["low"])-float(lo)) < 1e-4 and abs(float(x["high"])-float(hi)) < 1e-4), None)
+                ordered.append(match or {"low": lo, "high": hi, "role": item.get("reason"), "reaction_watch": "منطقة تفاعل محتملة."})
+        return ordered
+    structure_snapshot = {tf: {
+        "direction": (per_tf.get(tf, {}).get("structure") or {}).get("direction"),
+        "bos": (per_tf.get(tf, {}).get("structure") or {}).get("bos"),
+        "choch": (per_tf.get(tf, {}).get("structure") or {}).get("choch"),
+        "swing_high": ((per_tf.get(tf, {}).get("structure") or {}).get("swing_high") or {}).get("price"),
+        "swing_low": ((per_tf.get(tf, {}).get("structure") or {}).get("swing_low") or {}).get("price"),
+        "swing_high_status": (per_tf.get(tf, {}).get("structure") or {}).get("swing_high_status"),
+        "swing_low_status": (per_tf.get(tf, {}).get("structure") or {}).get("swing_low_status")
+    } for tf in TIMEFRAMES if tf in per_tf}
+    return {
+        "section_name": "خريطة السيناريوهات وتحركات السوق",
+        "independent_from_entry_analysis": True,
+        "purpose": "توقع مسارات شرطية ومناطق جذب/توقف/تفاعل السعر فقط؛ لا تحتوي نقاط دخول أو وقف أو أهداف صفقة.",
+        "current_reference": round(current, 5),
+        "reference_is_live": data_integrity.get("price_reference", {}).get("is_live_quote", False),
+        "bullish": {
+            "activation": bull_path.get("trigger"),
+            "route_in_order": route(bull_levels, supply, bull_path.get("possible_path", [])),
+            "nearby_buy_side_liquidity": bull_levels,
+            "potential_reaction_zones": supply,
+            "invalidation": bull_path.get("invalidation"),
+            "reading": "إذا تحقق التحول الهيكلي والإغلاق المطلوب، تُراقب المستويات بالتتابع. عند كل مستوى قد يحدث رفض أو اختراق؛ لا يُفترض استمرار السعر تلقائيًا."
+        },
+        "bearish": {
+            "activation": bear_path.get("trigger"),
+            "route_in_order": route(bear_levels, demand, bear_path.get("possible_path", [])),
+            "nearby_sell_side_liquidity": bear_levels,
+            "potential_reaction_zones": demand,
+            "invalidation": bear_path.get("invalidation"),
+            "reading": "إذا تحقق التحول الهيكلي والإغلاق المطلوب، تُراقب المستويات بالتتابع. عند كل مستوى قد يحدث ارتداد أو اختراق؛ لا يُفترض استمرار السعر تلقائيًا."
+        },
+        "major_stopping_or_reaction_areas": {"supply": supply, "demand": demand},
+        "higher_timeframe_structure": structure_snapshot,
+        "integrity_warnings": data_integrity.get("structural_state_warnings", []),
+        "methodology": [
+            "ترتيب القراءة: سيولة الفريمات العليا ثم هيكل السوق ثم السيولة الخارجية ثم المناطق الفنية.",
+            "المناطق المخفية المقصودة هنا هي تجمعات/مناطق مستنتجة من OHLC؛ ليست أوامر مؤسسية مرئية مباشرة.",
+            "لا يتم اختراع مستويات عند غيابها؛ تُعرض البيانات المتاحة فقط."
+        ],
+        "disclaimer": "سيناريوهات احتمالية مشروطة وليست توقعًا مؤكدًا أو توصية تداول."
+    }
+
+
+def build_scenario_telegram_report(scenarios: dict) -> str:
+    def fmt(v):
+        return "غير متاح" if v is None else f"{float(v):,.2f}"
+    def ar_trigger(value):
+        if not value:
+            return "غير متاح"
+        if "bullish structure shift" in value:
+            return "تحول هيكلي صاعد على 15 دقيقة أو الساعة، ثم إغلاق شمعة أعلى أقرب قمة محلية مؤكدة."
+        if "bearish structure shift" in value:
+            return "تحول هيكلي هابط على 15 دقيقة أو الساعة، ثم إغلاق شمعة أسفل أقرب قاع محلي مؤكد."
+        return value
+    lines = [
+        "🧭 خريطة السيناريوهات وتحركات السوق — قسم مستقل",
+        f"السعر المرجعي: {fmt(scenarios.get('current_reference'))} | مباشر: {'نعم' if scenarios.get('reference_is_live') else 'لا'}",
+        "",
+        "🟢 السيناريو الصاعد",
+        f"شرط التفعيل: {ar_trigger(scenarios.get('bullish', {}).get('activation'))}"
+    ]
+    for i, item in enumerate(scenarios.get("bullish", {}).get("route_in_order", [])[:8], 1):
+        if "price" in item:
+            lines.append(f"{i}) {fmt(item.get('price'))} | {item.get('type', 'مستوى سيولة')} | {item.get('reaction_watch', '')}")
+        else:
+            lines.append(f"{i}) منطقة {fmt(item.get('low'))}–{fmt(item.get('high'))} | {item.get('reaction_watch', '')}")
+    lines.append(f"إبطال السيناريو: {scenarios.get('bullish', {}).get('invalidation') or 'غير متاح'}")
+    lines.extend(["", "🔴 السيناريو الهابط", f"شرط التفعيل: {ar_trigger(scenarios.get('bearish', {}).get('activation'))}"])
+    for i, item in enumerate(scenarios.get("bearish", {}).get("route_in_order", [])[:8], 1):
+        if "price" in item:
+            lines.append(f"{i}) {fmt(item.get('price'))} | {item.get('type', 'مستوى سيولة')} | {item.get('reaction_watch', '')}")
+        else:
+            lines.append(f"{i}) منطقة {fmt(item.get('low'))}–{fmt(item.get('high'))} | {item.get('reaction_watch', '')}")
+    lines.append(f"إبطال السيناريو: {scenarios.get('bearish', {}).get('invalidation') or 'غير متاح'}")
+    lines.extend(["", "مناطق التوقف/التفاعل المحتملة:"])
+    for label, key in (("عرض", "supply"), ("طلب", "demand")):
+        zones = scenarios.get("major_stopping_or_reaction_areas", {}).get(key, [])
+        lines.append(label + ": " + ("؛ ".join(f"{fmt(z.get('low'))}–{fmt(z.get('high'))}" for z in zones[:5]) if zones else "لا توجد مناطق مرصودة"))
+    lines.extend(["", "تنبيه: هذا القسم مستقل عن نقاط الدخول، ولا يصدر دخولًا أو وقفًا أو أهداف صفقة. المناطق مستنتجة من بيانات الشموع وليست أوامر مؤسسية مرئية."])
+    return "\n".join(lines)
+
+
 def build_screening_summary(current: float, volatility: float,
                             buy_zones: List[dict], sell_zones: List[dict]) -> dict:
     all_zones = [("BUY", z) for z in buy_zones] + [("SELL", z) for z in sell_zones]
@@ -1295,6 +1537,8 @@ def analyze_market(frames: Dict[str, List[dict]], quality: dict,
             "atr": round(volatility, 5),
             "latest_close": round(candles[-1]["close"], 5),
             "latest_datetime": candles[-1]["datetime"],
+            "latest_candle_close_time": candle_end_time(
+                datetime.fromtimestamp(candles[-1]["_ts"], tz=timezone.utc), tf).isoformat(),
             "structure": structure,
             "structure_consistency": {
                 "contradiction": bool(
@@ -1404,7 +1648,7 @@ def analyze_market(frames: Dict[str, List[dict]], quality: dict,
     else:
         decision = "NO_TRADE"
 
-    return {
+    result = {
         "engine": ENGINE_NAME, "version": VERSION, "symbol": SYMBOL,
         "decision": decision, "current_price": round(current, 5),
         "price_source": "LIVE_QUOTE" if quote_valid else "LAST_15MIN_CANDLE_CLOSE_NOT_LIVE",
@@ -1452,9 +1696,14 @@ def analyze_market(frames: Dict[str, List[dict]], quality: dict,
             "note": "The legacy best_plan remains strictly filtered. research_candidate_map separately ranks every detected zone for paper research; it never authorizes execution."
         },
         "price_path": path,
+        "data_integrity": build_data_integrity_diagnostics(
+            per_tf, liquidity, current, "LIVE_QUOTE" if quote_valid else "LAST_15MIN_CANDLE_CLOSE_NOT_LIVE"),
         "data_validation": quality,
         "risk_notice": "Research and paper-testing only. No automatic execution; no setup is guaranteed and no score is a win probability."
     }
+    result["market_scenarios"] = build_market_scenarios(
+        current, path, result["scenario_ladder"], per_tf, liquidity, result["data_integrity"])
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1698,7 +1947,7 @@ def health():
         "timestamp_policy": "epoch or timezone-offset timestamps accepted; naive timestamps use configured per-timeframe IANA timezone",
         "engine_health_monitor": "enabled",
         "partial_timeframe_policy": "15min reference required; other timeframes may be excluded with warnings",
-        "plan_policy": "conditional_analysis_only; no_auto_execution; six_timeframe_scenario_ladder"
+        "plan_policy": "conditional_analysis_only; no_auto_execution; six_timeframe_scenario_ladder; standalone_market_scenarios"
     })
 
 
@@ -1721,6 +1970,7 @@ def analyze():
             return jsonify(response), 422
         result = analyze_market(frames, quality, live_quote)
         result["telegram_report"] = build_telegram_report(result)
+        result["telegram_scenario_report"] = build_scenario_telegram_report(result["market_scenarios"])
         return jsonify(result), 200
     except Exception as exc:
         logger.exception("Unhandled analysis error")
