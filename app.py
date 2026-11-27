@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from flask import Flask, request, jsonify
 
-VERSION = "6.0.0"
+VERSION = "6.1.0"
 ENGINE_NAME = "Gold Analysis Engine"
 SYMBOL = "XAU/USD"
 TIMEFRAMES = ["15min", "1h", "4h", "1day", "1week", "1month"]
@@ -510,6 +510,12 @@ def pivots(candles: List[dict], left: int = 3, right: int = 3) -> Tuple[List[dic
 
 
 def structure_summary(candles: List[dict]) -> dict:
+    """Return swing context plus a BOS/CHoCH event on the latest candle only.
+
+    A close that remains beyond an old swing is structural context, not a fresh
+    break event. Requiring a prior-close cross prevents stale BOS labels from
+    being reused as fresh entry confirmation on every subsequent candle.
+    """
     highs, lows = pivots(candles)
     rh, rl = highs[-3:], lows[-3:]
     hh = len(rh) >= 2 and rh[-1]["price"] > rh[-2]["price"]
@@ -517,11 +523,18 @@ def structure_summary(candles: List[dict]) -> dict:
     lh = len(rh) >= 2 and rh[-1]["price"] < rh[-2]["price"]
     ll = len(rl) >= 2 and rl[-1]["price"] < rl[-2]["price"]
     direction = "BULLISH" if hh and hl else "BEARISH" if lh and ll else "RANGE"
-    close = candles[-1]["close"]
     last_high = highs[-1] if highs else None
     last_low = lows[-1] if lows else None
-    bos = ("BULLISH_BOS" if last_high and close > last_high["price"] else
-           "BEARISH_BOS" if last_low and close < last_low["price"] else None)
+    previous_close = candles[-2]["close"] if len(candles) >= 2 else None
+    close = candles[-1]["close"] if candles else None
+    crossed_up = bool(last_high and previous_close is not None and
+                      previous_close <= last_high["price"] < close)
+    crossed_down = bool(last_low and previous_close is not None and
+                        previous_close >= last_low["price"] > close)
+    # If one unusually large candle crosses both boundaries, treat it as a
+    # range-expansion event, not a directional BOS suitable for entry scoring.
+    bos = ("BULLISH_BOS" if crossed_up and not crossed_down else
+           "BEARISH_BOS" if crossed_down and not crossed_up else None)
     choch = ("BULLISH_CHOCH" if direction == "BEARISH" and bos == "BULLISH_BOS" else
              "BEARISH_CHOCH" if direction == "BULLISH" and bos == "BEARISH_BOS" else None)
     return {
@@ -529,7 +542,8 @@ def structure_summary(candles: List[dict]) -> dict:
         "swing_high": last_high, "swing_low": last_low,
         "higher_high": bool(hh), "higher_low": bool(hl),
         "lower_high": bool(lh), "lower_low": bool(ll),
-        "pivot_high_count": len(highs), "pivot_low_count": len(lows)
+        "pivot_high_count": len(highs), "pivot_low_count": len(lows),
+        "break_event_is_latest_candle": bool(bos)
     }
 
 
@@ -642,7 +656,14 @@ def build_zones(candles: List[dict], current: float, side: str, tf: str) -> List
         if side == "SELL" and mid <= current:
             continue
         impulse_score = min(1.0, impulse / max(volatility*2.2, 1e-9))
-        freshness = max(0.0, 1 - age/180)
+        # Freshness horizon is timeframe-aware. A monthly zone should not
+        # receive the same freshness score as a 15-minute zone merely because
+        # both are 30 candles old.
+        freshness_horizon = {
+            "15min": 48, "1h": 72, "4h": 60,
+            "1day": 45, "1week": 26, "1month": 12
+        }.get(tf, 48)
+        freshness = max(0.0, 1 - age / freshness_horizon)
         test_score = {0: 1.0, 1: 0.92, 2: 0.72, 3: 0.45}.get(tests, 0)
         narrow = max(0.0, 1 - width/max(volatility*1.8, 1e-9))
         reaction = rejection_strength(candles[i+1], side) if i+1 < len(candles) else 0
@@ -696,14 +717,19 @@ def combine_zone_confluence(zones: List[dict]) -> List[dict]:
 
 def zone_collections(zones: List[dict], volatility: float) -> dict:
     near_limit = max(volatility * 2.0, 0.0)
+    active_limit = max(volatility * 4.0, 0.0)
     near = [z for z in zones if z["distance"] <= near_limit]
+    active = [z for z in zones if z["distance"] <= active_limit]
     far = [z for z in zones if z["distance"] > near_limit]
+    # Do not label a zone hundreds of ATR away as a nearest actionable area.
+    # Keep it visible under distant context instead of mixing it with active zones.
     return {
-        "nearest": zones[:5],
+        "nearest": active[:5],
         "nearby": near[:8],
         "distant": far[:8],
         "strong_nearby": [z for z in near if z["score"] >= 75][:5],
-        "strong_distant": [z for z in far if z["score"] >= 75][:5]
+        "strong_distant": [z for z in far if z["score"] >= 75][:5],
+        "active_distance_limit_atr": 4.0
     }
 
 
@@ -733,14 +759,28 @@ def confirmation_evidence(candles: List[dict], zone: dict, side: str,
                           volatility: float, liquidity: dict) -> dict:
     """Evaluate touch, rejection, displacement and structure separately."""
     recent = candles[-5:]
-    touched = any(c["low"] <= zone["high"] and c["high"] >= zone["low"] for c in recent)
+    touch_offsets = [i for i, c in enumerate(recent)
+                     if c["low"] <= zone["high"] and c["high"] >= zone["low"]]
+    touched = bool(touch_offsets)
+    bars_since_touch = (len(recent) - 1 - touch_offsets[-1]) if touched else None
     last = candles[-1]
-    rejection = rejection_strength(last, side)
+    # Evaluate rejection from the latest actual zone interaction, rather than
+    # requiring the final displacement candle itself to have a rejection wick.
+    reaction_window = recent[touch_offsets[-1]:] if touched else [last]
+    rejection = max(rejection_strength(c, side) for c in reaction_window)
     disp = displacement_score(candles, volatility, side)
     structure = structure_summary(candles)
     expected_bos = "BULLISH_BOS" if side == "BUY" else "BEARISH_BOS"
-    bos_confirmed = structure.get("bos") == expected_bos or structure.get("choch") == (
-        "BULLISH_CHOCH" if side == "BUY" else "BEARISH_CHOCH")
+    expected_choch = "BULLISH_CHOCH" if side == "BUY" else "BEARISH_CHOCH"
+    # Accept a genuine break event within the last three candles. Recompute
+    # each endpoint so a BOS from many candles ago cannot masquerade as fresh.
+    recent_structure = [(end, structure_summary(candles[:end]))
+                        for end in range(max(2, len(candles)-2), len(candles)+1)]
+    event_matches = [(end, item) for end, item in recent_structure
+                     if item.get("bos") == expected_bos or
+                     item.get("choch") == expected_choch]
+    bos_confirmed = bool(event_matches)
+    recent_event_end, recent_event = event_matches[-1] if event_matches else (None, {})
     sweep = liquidity.get("recent_sweep") or {}
     expected_sweep = "SELL_SIDE_SWEPT" if side == "BUY" else "BUY_SIDE_SWEPT"
     sweep_confirmed = sweep.get("side") == expected_sweep
@@ -758,7 +798,9 @@ def confirmation_evidence(candles: List[dict], zone: dict, side: str,
         "confirmation_score": round(score, 2),
         "rejection_strength": rejection,
         "displacement_strength": disp,
-        "structure_event": structure.get("bos") or structure.get("choch"),
+        "bars_since_last_zone_touch": bars_since_touch,
+        "structure_event": recent_event.get("bos") or recent_event.get("choch"),
+        "structure_event_age_candles": (len(candles) - recent_event_end) if recent_event_end else None,
         "recent_liquidity_sweep": sweep if sweep else None,
         "confirmed": bool(touched and rejection >= 0.55 and disp >= 0.55 and bos_confirmed)
     }
@@ -848,7 +890,7 @@ def make_trade_plan(zone: Optional[dict], side: str, current: float,
             "directional_alignment": aligned,
             "confirmation": evidence
         },
-        "confirmation_required": "انتظر لمس المنطقة ثم شمعة رفض وإزاحة واضحة وتحول هيكلي على فريم التنفيذ؛ اللمس وحده ليس إشارة دخول.",
+        "confirmation_required": "انتظر لمس المنطقة ثم رفضًا سعريًا وإزاحة واضحة وكسرًا هيكليًا حديثًا على فريم التنفيذ؛ سحب السيولة دليل إضافي قوي وليس شرطًا مطلقًا لكل حركة.",
         "setup_status": status,
         "trade_allowed_now": False,
         "invalidation": "إلغاء السيناريو عند إغلاق واضح خلف حد الإبطال؛ لا توسّع وقف الخسارة بعد الدخول.",
