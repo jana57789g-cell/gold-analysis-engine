@@ -253,8 +253,7 @@ def extract_live_quote(payload: Any, now: Optional[datetime] = None) -> dict:
     if not candidates:
         return {"valid": False, "price": None, "timestamp": None,
                 "age_seconds": None, "reason": "LIVE_QUOTE_MISSING"}
-
-    raw = candidates[0]
+raw = candidates[0]
     if isinstance(raw, list) and raw and isinstance(raw[0], dict):
         raw = raw[0]
     if not isinstance(raw, dict):
@@ -325,7 +324,7 @@ def normalize_payload(payload: Any) -> Tuple[Dict[str, List[dict]], List[str], L
         input_count = len(rows)
         parsed: List[dict] = []
         invalid_count = 0
-                future_count = 0
+        future_count = 0
         for idx, row in enumerate(rows):
             try:
                 if not isinstance(row, dict):
@@ -451,8 +450,7 @@ def data_quality_report(frames: Dict[str, List[dict]], errors: List[str],
                           "latest_close": None, "future_seconds": None,
                           "age_after_candle_close_seconds": None}
             blockers.append(f"{tf}:no_usable_candles")
-
-    if errors:
+if errors:
         blockers.extend(errors)
     valid_counts = all(len(frames.get(tf, [])) >= MIN_COMPLETE_CANDLES for tf in TIMEFRAMES)
     valid = not blockers and valid_counts
@@ -609,8 +607,6 @@ def liquidity_map(candles: List[dict], current: float, volatility: float) -> dic
         "nearest_below": below[0] if below else None,
         "note": "Liquidity pools are inferred from historical swing clusters; resting orders are not directly visible."
     }
-
-
 # ---------------------------------------------------------------------------
 # Reversal zones, ranked by distance first and strength second.
 # Nearby and distant zones are reported separately.
@@ -652,7 +648,7 @@ def build_zones(candles: List[dict], current: float, side: str, tf: str) -> List
                 tests += 1
             inside = overlaps
         if tests > 3:
-                        continue
+            continue
         mid = (lo + hi) / 2
         # A buy zone must be below price; a sell zone must be above price.
         if side == "BUY" and mid >= current:
@@ -743,9 +739,8 @@ def zone_collections(zones: List[dict], volatility: float) -> dict:
         "strong_nearby": [z for z in near if z["score"] >= 75][:5],
         "strong_distant": [z for z in far if z["score"] >= 75][:5],
         "active_distance_limit_atr": 4.0
-    }
-
-
+        }
+        
 # ---------------------------------------------------------------------------
 # Scenario, path and trade plan construction
 # ---------------------------------------------------------------------------
@@ -949,7 +944,7 @@ def build_price_path(current: float, volatility: float, structure: dict,
     downside_target = max(downside) if downside else (
         structure["swing_low"]["price"] if structure.get("swing_low") and structure["swing_low"]["price"] < current else None
     )
-    bullish_steps = []
+     bullish_steps = []
     bearish_steps = []
     if upside_target is not None:
         bullish_steps.append({"level": round(upside_target, 5), "reason": "nearest_observed_buy_side_liquidity"})
@@ -979,7 +974,7 @@ def build_price_path(current: float, volatility: float, structure: dict,
 
 def analyze_market(frames: Dict[str, List[dict]], quality: dict,
                    live_quote: Optional[dict] = None) -> dict:
-                           primary = frames["15min"]
+    primary = frames["15min"]
     quote_valid = bool(live_quote and live_quote.get("valid"))
     current = live_quote["price"] if quote_valid else primary[-1]["close"]
     per_tf, votes = {}, {"BULLISH": 0, "BEARISH": 0, "RANGE": 0}
@@ -1118,9 +1113,8 @@ def analyze_market(frames: Dict[str, List[dict]], quality: dict,
         "price_path": path,
         "data_validation": quality,
         "risk_notice": "Analytical scenarios only; no trade is authorized automatically. Backtest out-of-sample before relying on any setup."
-    }
-
-
+}
+   
 # ---------------------------------------------------------------------------
 # Human-readable report for Telegram / AI formatting node
 # ---------------------------------------------------------------------------
@@ -1303,4 +1297,4 @@ def method_not_allowed(_):
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port)         
