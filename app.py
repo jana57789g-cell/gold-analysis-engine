@@ -12,7 +12,7 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 __all__ = ["app"]
 
-VERSION = "7.2.0"
+VERSION = "7.3.0"
 ENGINE_NAME = "Gold Analysis Engine"
 SYMBOL = "XAU/USD"
 TIMEFRAMES = ["15min", "1h", "4h", "1day", "1week", "1month"]
@@ -993,6 +993,101 @@ def build_price_path(current: float, volatility: float, structure: dict,
     }
 
 
+
+def build_scenario_ladder(current: float, liquidity: dict,
+                          buy_zones: List[dict], sell_zones: List[dict],
+                          per_tf: Dict[str, dict], price_path: dict) -> dict:
+    """Descriptive, conditional market map for research and paper review only."""
+    pools = list(liquidity.get("higher_timeframe_pools", []))
+    pools += list(liquidity.get("equal_highs", []))
+    pools += list(liquidity.get("equal_lows", []))
+    unique = {}
+    for pool in pools:
+        try:
+            price = round(float(pool["price"]), 5)
+        except (KeyError, TypeError, ValueError):
+            continue
+        key = (price, pool.get("type"))
+        unique.setdefault(key, {**pool, "price": price})
+
+    above = sorted((x for x in unique.values() if x["price"] > current),
+                   key=lambda x: x["price"])[:6]
+    below = sorted((x for x in unique.values() if x["price"] < current),
+                   key=lambda x: x["price"], reverse=True)[:6]
+
+    def zone_view(zones: List[dict]) -> List[dict]:
+        out = []
+        for z in sorted(zones, key=lambda x: (x.get("distance", 1e99), -x.get("score", 0)))[:6]:
+            out.append({
+                "low": z.get("low"), "high": z.get("high"),
+                "mid": z.get("mid"), "distance": z.get("distance"),
+                "distance_atr": z.get("distance_atr"),
+                "score": z.get("score"), "strength": z.get("strength_label"),
+                "timeframes": z.get("timeframes", []),
+                "tests": z.get("tests"), "age_candles": z.get("age_candles"),
+                "status": z.get("status", "UNCONFIRMED")
+            })
+        return out
+
+    structure = {}
+    for tf in TIMEFRAMES:
+        item = per_tf.get(tf)
+        if not item:
+            structure[tf] = {"available": False}
+            continue
+        st = item.get("structure", {})
+        structure[tf] = {
+            "available": True,
+            "direction": st.get("direction"),
+            "bos": st.get("bos"), "choch": st.get("choch"),
+            "swing_high": (st.get("swing_high") or {}).get("price"),
+            "swing_low": (st.get("swing_low") or {}).get("price"),
+            "latest_close": item.get("latest_close"),
+            "atr": item.get("atr")
+        }
+
+    return {
+        "mode": "CONDITIONAL_RESEARCH_AND_PAPER_REVIEW_ONLY",
+        "current_reference": round(current, 5),
+        "upward_observed_levels": above,
+        "downward_observed_levels": below,
+        "demand_zones_to_monitor": zone_view(buy_zones),
+        "supply_zones_to_monitor": zone_view(sell_zones),
+        "timeframe_structure": structure,
+        "bullish_condition": price_path.get("bullish_scenario", {}).get("trigger"),
+        "bullish_invalidation": price_path.get("bullish_scenario", {}).get("invalidation"),
+        "bearish_condition": price_path.get("bearish_scenario", {}).get("trigger"),
+        "bearish_invalidation": price_path.get("bearish_scenario", {}).get("invalidation"),
+        "interpretation": (
+            "المستويات مناطق مراقبة مستنتجة من الشموع وليست أوامر دخول أو ضمانًا للحركة. "
+            "يُشترط انتظار إغلاق وتأكيد هيكلي؛ وقد تتغير الخريطة مع وصول شموع جديدة."
+        )
+    }
+
+
+def build_screening_summary(current: float, volatility: float,
+                            buy_zones: List[dict], sell_zones: List[dict]) -> dict:
+    all_zones = [("BUY", z) for z in buy_zones] + [("SELL", z) for z in sell_zones]
+    within_2 = [x for x in all_zones if x[1].get("distance_atr", 999) <= 2.0]
+    within_4 = [x for x in all_zones if x[1].get("distance_atr", 999) <= 4.0]
+    score_pass = [x for x in all_zones if x[1].get("score", 0) >= MIN_PLAN_ZONE_SCORE]
+    both = [x for x in all_zones if x[1].get("distance_atr", 999) <= MAX_PLAN_DISTANCE_ATR
+            and x[1].get("score", 0) >= MIN_PLAN_ZONE_SCORE]
+    return {
+        "buy_zone_count": len(buy_zones), "sell_zone_count": len(sell_zones),
+        "zones_within_2_atr": len(within_2), "zones_within_4_atr": len(within_4),
+        "zones_meeting_score_threshold": len(score_pass),
+        "zones_meeting_current_plan_distance_and_score": len(both),
+        "current_distance_filter_atr": MAX_PLAN_DISTANCE_ATR,
+        "current_minimum_score": MIN_PLAN_ZONE_SCORE,
+        "nearest_buy_zone_distance_atr": min((z.get("distance_atr", 1e99) for z in buy_zones), default=None),
+        "nearest_sell_zone_distance_atr": min((z.get("distance_atr", 1e99) for z in sell_zones), default=None),
+        "explanation": (
+            "عدد المناطق المعروضة لا يعني وجود إعداد مؤكد. تُعرض المناطق القريبة والبعيدة للسياق، "
+            "ويُفصل بين قرب المنطقة وجودة المنطقة والتأكيد الهيكلي."
+        )
+    }
+
 def _plan_rank(plan: dict) -> tuple:
     confirmation = plan.get("entry_basis", {}).get("confirmation", {})
     evidence_score = confirmation.get("confirmation_score", 0)
@@ -1144,6 +1239,8 @@ def analyze_market(frames: Dict[str, List[dict]], quality: dict,
             "all_buy_zones": sorted(buy_zones, key=lambda z: (-z["score"], z["distance"]))[:30],
             "all_sell_zones": sorted(sell_zones, key=lambda z: (-z["score"], z["distance"]))[:30]
         },
+        "scenario_ladder": build_scenario_ladder(current, liquidity, buy_zones, sell_zones, per_tf, path),
+        "screening_summary": build_screening_summary(current, current_vol, buy_zones, sell_zones),
         "entry_analysis": {
             "buy_plan": buy_plan, "sell_plan": sell_plan,
             "best_plan": best_plan,
@@ -1248,6 +1345,58 @@ def build_telegram_report(result: dict) -> str:
         lines.append("⛔ سبب تعذر التحليل: " + "؛ ".join(quality["blockers"][:8]))
     if quality.get("warnings"):
         lines.append("⚠️ تحذيرات البيانات: " + "؛ ".join(quality["warnings"][:8]))
+    lines.extend(["", "🧭 قراءة الفريمات الستة"])
+    for tf in TIMEFRAMES:
+        item = result.get("timeframe_analysis", {}).get(tf, {})
+        st = item.get("structure", {})
+        if not item:
+            lines.append(f"- {tf}: غير متاح")
+            continue
+        lines.append(
+            f"- {tf}: الاتجاه {direction_labels.get(st.get('direction'), st.get('direction', 'غير محدد'))}"
+            f" | BOS: {st.get('bos') or 'لا يوجد'} | CHoCH: {st.get('choch') or 'لا يوجد'}"
+            f" | قمة: {fmt_price((st.get('swing_high') or {}).get('price'))}"
+            f" | قاع: {fmt_price((st.get('swing_low') or {}).get('price'))}"
+        )
+
+    ladder = result.get("scenario_ladder", {})
+    lines.extend(["", "🪜 خريطة الحركة الشرطية — مستويات مراقبة وليست أوامر"])
+    for title, key in (("مستويات أعلى السعر", "upward_observed_levels"),
+                       ("مستويات أسفل السعر", "downward_observed_levels")):
+        lines.append(title + ":")
+        levels = ladder.get(key, [])
+        if not levels:
+            lines.append("- لا توجد تجمعات مرصودة في هذا الاتجاه ضمن البيانات الحالية.")
+        for pool in levels[:6]:
+            lines.append(
+                f"- {fmt_price(pool.get('price'))} | {pool.get('type', 'LIQUIDITY')}"
+                f" | الفريم: {pool.get('timeframe', '15min/مجمع')} | اللمسات: {pool.get('touches', 0)}"
+            )
+
+    for title, key in (("مناطق طلب للمراقبة", "demand_zones_to_monitor"),
+                       ("مناطق عرض للمراقبة", "supply_zones_to_monitor")):
+        lines.append(title + ":")
+        zones = ladder.get(key, [])
+        if not zones:
+            lines.append("- لا توجد مناطق صالحة مستخرجة.")
+        for z in zones[:6]:
+            lines.append(
+                f"- {fmt_price(z.get('low'))}–{fmt_price(z.get('high'))}"
+                f" | التقييم {z.get('score')}/100 | البعد {z.get('distance_atr')} ATR"
+                f" | الفريمات: {','.join(z.get('timeframes', [])) or 'غير محدد'}"
+                f" | الاختبارات: {z.get('tests')} | {z.get('strength', 'غير محدد')}"
+            )
+
+    screening = result.get("screening_summary", {})
+    lines.extend([
+        "", "🔎 لماذا لم يظهر مرشح؟",
+        f"- مناطق شراء: {screening.get('buy_zone_count', 0)} | مناطق بيع: {screening.get('sell_zone_count', 0)}",
+        f"- مناطق ضمن 2 ATR: {screening.get('zones_within_2_atr', 0)} | ضمن 4 ATR: {screening.get('zones_within_4_atr', 0)}",
+        f"- مناطق حققت حد التقييم: {screening.get('zones_meeting_score_threshold', 0)}",
+        f"- مناطق حققت شرطي المسافة والتقييم الحاليين: {screening.get('zones_meeting_current_plan_distance_and_score', 0)}",
+        f"- أقرب شراء: {screening.get('nearest_buy_zone_distance_atr')} ATR | أقرب بيع: {screening.get('nearest_sell_zone_distance_atr')} ATR"
+    ])
+
     lines.extend(["", "📍 أقرب مناطق الانعكاس"])
     for side, label in (("buy", "شراء"), ("sell", "بيع")):
         group = result["reversal_zones"][side]
@@ -1280,7 +1429,13 @@ def build_telegram_report(result: dict) -> str:
         f"- أقرب سيولة أسفل: {fmt_price(result['liquidity']['nearest_below']['price']) if result['liquidity']['nearest_below'] else 'غير مرصودة'}",
         f"- تجمعات HTF المرصودة: {len(result['liquidity'].get('higher_timeframe_pools', []))}",
         f"- آخر سحب سيولة: {('لا يوجد سحب مؤكد حديث' if not result['liquidity'].get('recent_sweep') else 'تم رصد سحب سيولة حديث')}",
-        "", "تنبيه: النتائج تحليلية واختبارية فقط؛ ليست توصية تنفيذ أو ضمانًا للنتيجة."
+        "", "تفسير السيناريو الصاعد:",
+        f"- الشرط: {bull.get('trigger')}",
+        f"- الإبطال: {bull.get('invalidation')}",
+        "تفسير السيناريو الهابط:",
+        f"- الشرط: {bear.get('trigger')}",
+        f"- الإبطال: {bear.get('invalidation')}",
+        "", "تنبيه: النتائج خريطة تحليلية واختبارية فقط؛ ليست توصية تنفيذ أو ضمانًا للنتيجة."
     ])
     return "\n".join(lines)
 
@@ -1310,7 +1465,7 @@ def health():
         "timestamp_policy": "epoch or timezone-offset timestamps accepted; naive timestamps use configured per-timeframe IANA timezone",
         "engine_health_monitor": "enabled",
         "partial_timeframe_policy": "15min reference required; other timeframes may be excluded with warnings",
-        "plan_policy": "one_best_conditional_candidate; no_auto_execution"
+        "plan_policy": "conditional_analysis_only; no_auto_execution; six_timeframe_scenario_ladder"
     })
 
 
