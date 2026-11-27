@@ -1190,7 +1190,7 @@ def build_telegram_report(result: dict) -> str:
     weighted = market.get("weighted_timeframe_votes", {})
     lines = [
         f"📊 {ENGINE_NAME} | {SYMBOL} | v{VERSION}",
-        f"السعر المرجعي: {fmt_price(result['current_price'])} ({'سعر مباشر' if result.get('price_source') == 'LIVE_QUOTE' else 'آخر إغلاق 15 دقيقة — ليس سعرًا مباشرًا'})",
+        f"السعر الحالي: {fmt_price(result['current_price'])} ({'سعر مباشر' if result.get('price_source') == 'LIVE_QUOTE' else 'آخر إغلاق 15 دقيقة — ليس سعرًا مباشرًا'})",
         f"القرار: {decision}",
         f"الاتجاه العام: {direction_labels.get(market['directional_bias'], market['directional_bias'])} | توافق الفريمات: {market['timeframe_alignment_score']}",
         f"تصويت الفريمات: {votes_text(votes)}",
