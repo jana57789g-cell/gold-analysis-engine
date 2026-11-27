@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from flask import Flask, request, jsonify
 
-VERSION = "5.4.0"
+VERSION = "5.5.0"
 ENGINE_NAME = "Gold Analysis Engine"
 SYMBOL = "XAU/USD"
 TIMEFRAMES = ["15min", "1h", "4h", "1day", "1week", "1month"]
@@ -24,6 +24,7 @@ if not 1 <= MIN_COMPLETE_CANDLES <= MAX_CANDLES:
     raise ValueError("MIN_COMPLETE_CANDLES must be between 1 and MAX_CANDLES")
 PREFERRED_COMPLETE_CANDLES = 30
 FUTURE_TOLERANCE_SECONDS = 60
+LIVE_QUOTE_MAX_AGE_SECONDS = int(os.getenv("LIVE_QUOTE_MAX_AGE_SECONDS", "180"))
 CANDLE_TIMESTAMP_TYPE = os.getenv("CANDLE_TIMESTAMP_TYPE", "open").strip().lower()
 if CANDLE_TIMESTAMP_TYPE not in {"open", "close"}:
     raise ValueError("CANDLE_TIMESTAMP_TYPE must be 'open' or 'close'")
@@ -37,7 +38,7 @@ logger = logging.getLogger("gold_analysis_engine")
 # Safe input normalization
 # ---------------------------------------------------------------------------
 
-def parse_time(value: Any, source_timezone: Optional[str] = None) -> datetime:
+def parse_time_local(value: Any, source_timezone: Optional[str] = None) -> datetime:
     if isinstance(value, bool):
         raise ValueError("invalid_timestamp")
     if isinstance(value, (int, float)):
@@ -73,7 +74,11 @@ def parse_time(value: Any, source_timezone: Optional[str] = None) -> datetime:
         except ZoneInfoNotFoundError as exc:
             raise ValueError(f"unknown_source_timezone:{source_timezone}") from exc
         dt = dt.replace(tzinfo=source_tz)
-    return dt.astimezone(timezone.utc)
+    return dt
+
+
+def parse_time(value: Any, source_timezone: Optional[str] = None) -> datetime:
+    return parse_time_local(value, source_timezone).astimezone(timezone.utc)
 
 
 def number(value: Any, field: str) -> float:
@@ -208,13 +213,55 @@ def _month_after(dt: datetime) -> datetime:
 
 
 def candle_end_time(candle_dt: datetime, timeframe: str) -> datetime:
-    """Return interval end using calendar arithmetic for monthly candles."""
+    """Return interval end in the source timezone before UTC conversion."""
     if CANDLE_TIMESTAMP_TYPE == "close":
         return candle_dt
+    from datetime import timedelta
     if timeframe == "1month":
         return _month_after(candle_dt)
-    from datetime import timedelta
+    if timeframe == "1day":
+        return candle_dt + timedelta(days=1)
+    if timeframe == "1week":
+        return candle_dt + timedelta(days=7)
     return candle_dt + timedelta(seconds=TF_SECONDS[timeframe])
+
+
+def extract_live_quote(payload: Any) -> dict:
+    """Accept an explicit live quote; never infer a live price from candle close."""
+    root = payload
+    if isinstance(root, list) and len(root) == 1 and isinstance(root[0], dict):
+        root = root[0].get("json", root[0])
+    candidate = None
+    if isinstance(root, dict):
+        for key in ("live_quote", "quote", "current_quote"):
+            if isinstance(root.get(key), dict):
+                candidate = root[key]
+                break
+        if candidate is None and isinstance(root.get("data"), dict):
+            for key in ("live_quote", "quote", "current_quote"):
+                if isinstance(root["data"].get(key), dict):
+                    candidate = root["data"][key]
+                    break
+    if not isinstance(candidate, dict):
+        return {"valid": False, "reason": "LIVE_QUOTE_MISSING", "price": None, "age_seconds": None}
+    raw_price = candidate.get("price", candidate.get("last", candidate.get("value", candidate.get("close"))))
+    raw_ts = candidate.get("timestamp", candidate.get("datetime", candidate.get("time", candidate.get("updated_at"))))
+    try:
+        price = number(raw_price, "live_quote_price")
+        if price <= 0:
+            raise ValueError("non_positive_live_quote_price")
+        quote_tz = candidate.get("timezone") or candidate.get("source_timezone")
+        quote_dt = parse_time(raw_ts, quote_tz)
+        now_ts = datetime.now(timezone.utc).timestamp()
+        age = now_ts - quote_dt.timestamp()
+        if age < -FUTURE_TOLERANCE_SECONDS:
+            return {"valid": False, "reason": "LIVE_QUOTE_FROM_FUTURE", "price": None, "age_seconds": round(age, 1)}
+        if age > LIVE_QUOTE_MAX_AGE_SECONDS:
+            return {"valid": False, "reason": "LIVE_QUOTE_STALE", "price": None, "age_seconds": round(age, 1)}
+        return {"valid": True, "reason": None, "price": price, "timestamp": quote_dt.isoformat(),
+                "age_seconds": round(max(0.0, age), 1)}
+    except Exception as exc:
+        return {"valid": False, "reason": str(exc), "price": None, "age_seconds": None}
 
 
 def normalize_payload(payload: Any) -> Tuple[Dict[str, List[dict]], List[str], List[str], Dict[str, dict]]:
@@ -265,7 +312,8 @@ def normalize_payload(payload: Any) -> Tuple[Dict[str, List[dict]], List[str], L
                 if not isinstance(row, dict):
                     raise ValueError("candle_must_be_object")
                 raw_dt = row.get("datetime", row.get("timestamp", row.get("time", row.get("date"))))
-                dt = parse_time(raw_dt, source_timezone)
+                local_dt = parse_time_local(raw_dt, source_timezone)
+                dt = local_dt.astimezone(timezone.utc)
                 o = number(row.get("open"), "open")
                 h = number(row.get("high"), "high")
                 lo = number(row.get("low"), "low")
@@ -287,10 +335,10 @@ def normalize_payload(payload: Any) -> Tuple[Dict[str, List[dict]], List[str], L
                 if dt.timestamp() > now_ts + FUTURE_TOLERANCE_SECONDS:
                     future_count += 1
                     errors.append(f"{tf}[{idx}]:future_timestamp_by_{int(dt.timestamp() - now_ts)}_seconds")
-                end_dt = candle_end_time(dt, tf)
+                end_dt = candle_end_time(local_dt, tf).astimezone(timezone.utc)
                 time_incomplete = end_dt.timestamp() > now_ts + FUTURE_TOLERANCE_SECONDS
                 parsed.append({
-                    "datetime": dt.isoformat(), "_ts": dt.timestamp(),
+                    "datetime": dt.isoformat(), "_ts": dt.timestamp(), "_end_ts": end_dt.timestamp(),
                     "open": o, "high": h, "low": lo, "close": c,
                     "volume": vol, "is_incomplete": bool(incomplete or time_incomplete)
                 })
@@ -358,9 +406,9 @@ def data_quality_report(frames: Dict[str, List[dict]], errors: List[str],
         counts = diagnostics.get(tf, {})
         if latest:
             latest_dt = datetime.fromtimestamp(latest["_ts"], tz=timezone.utc)
-            end_dt = candle_end_time(latest_dt, tf)
+            end_ts = latest.get("_end_ts", candle_end_time(latest_dt, tf).timestamp())
             future = latest["_ts"] - now_ts
-            age_after_close = max(0.0, now_ts - end_dt.timestamp())
+            age_after_close = max(0.0, now_ts - end_ts)
             if future > FUTURE_TOLERANCE_SECONDS:
                 blockers.append(f"{tf}:future_timestamp_by_{int(future)}_seconds")
             # A month is not stale merely because the prior completed month ended
@@ -397,6 +445,7 @@ def data_quality_report(frames: Dict[str, List[dict]], errors: List[str],
         "max_candles_per_timeframe": MAX_CANDLES,
         "minimum_complete_candles": MIN_COMPLETE_CANDLES,
         "preferred_complete_candles": PREFERRED_COMPLETE_CANDLES,
+        "live_quote_required": True, "live_quote_max_age_seconds": LIVE_QUOTE_MAX_AGE_SECONDS,
         "source_timezones_by_timeframe": {tf: diagnostics.get(tf, {}).get("source_timezone") for tf in TIMEFRAMES},
         "candle_timestamp_type": CANDLE_TIMESTAMP_TYPE,
         "timeframes": report,
@@ -616,13 +665,13 @@ def combine_zone_confluence(zones: List[dict], current: Optional[float] = None) 
             match["low"] = round(min(match["low"], zone["low"]), 5)
             match["high"] = round(max(match["high"], zone["high"]), 5)
             match["mid"] = round((match["low"] + match["high"]) / 2, 5)
+            # Update the representative ATR before deriving distance_atr.
+            match["source_atr"] = max(match.get("source_atr", 0.0), zone.get("source_atr", 0.0))
             if current is not None:
                 match["distance"] = round(abs(current - match["mid"]), 5)
                 match["distance_atr"] = round(
-                    match["distance"] / max(match.get("source_atr", 0.0), 1e-9), 2
+                    match["distance"] / max(match["source_atr"], 1e-9), 2
                 )
-            # Keep the largest source ATR represented by this confluence cluster.
-            match["source_atr"] = max(match.get("source_atr", 0.0), zone.get("source_atr", 0.0))
         else:
             kept.append({
                 "side": zone["side"], "low": zone["low"], "high": zone["high"],
@@ -659,63 +708,70 @@ def zone_collections(zones: List[dict], volatility: float) -> dict:
 
 def make_trade_plan(zone: Optional[dict], side: str, current: float,
                     volatility: float, liquidity: dict,
-                    data_blocked: bool) -> Optional[dict]:
-    if not zone or volatility <= 0:
+                    data_blocked: bool, opposing_zones: Optional[List[dict]] = None) -> Optional[dict]:
+    if not zone or volatility <= 0 or data_blocked:
         return None
     low, high, entry = zone["low"], zone["high"], zone["mid"]
-    # No plan is issued from a weak zone.
-    if zone["score"] < 60:
+    if zone["score"] < 65:
         return None
-    # Use the ATR of the timeframe that generated the selected zone.
+    # Avoid broad, low-precision confluence areas as actionable entry zones.
+    max_entry_width = max(volatility * 1.5, current * 0.0008)
+    if high - low > max_entry_width:
+        return None
     zone_volatility = float(zone.get("source_atr") or volatility)
     if not math.isfinite(zone_volatility) or zone_volatility <= 0:
         return None
-    stop = low - zone_volatility*0.22 if side == "BUY" else high + zone_volatility*0.22
+    stop = low - zone_volatility * 0.22 if side == "BUY" else high + zone_volatility * 0.22
     risk = abs(entry - stop)
     if risk <= 0:
         return None
-    # Long targets are overhead buy-side liquidity; short targets are
-    # downside sell-side liquidity. Never reverse these pools.
+
     pools = liquidity["buy_side_liquidity"] if side == "BUY" else liquidity["sell_side_liquidity"]
-    targets = sorted(
-        [p["price"] for p in pools if (p["price"] > entry if side == "BUY" else p["price"] < entry)],
-        reverse=(side == "SELL")
-    )
-    targets = [p for p in targets if abs(p-entry) >= risk*1.5]
+    candidates = [p["price"] for p in pools if (p["price"] > entry if side == "BUY" else p["price"] < entry)]
+    candidates = sorted(candidates, reverse=(side == "SELL"))
+
+    # Never set a target beyond the nearest opposing reversal zone.
+    opposing_zones = opposing_zones or []
+    if side == "BUY":
+        opposing = [z for z in opposing_zones if z["low"] > entry]
+        barrier = min(opposing, key=lambda z: z["low"]) if opposing else None
+        cap = (barrier["low"] - max(volatility * 0.05, current * 0.0001)) if barrier else None
+        candidates = [p for p in candidates if cap is None or p <= cap]
+    else:
+        opposing = [z for z in opposing_zones if z["high"] < entry]
+        barrier = max(opposing, key=lambda z: z["high"]) if opposing else None
+        cap = (barrier["high"] + max(volatility * 0.05, current * 0.0001)) if barrier else None
+        candidates = [p for p in candidates if cap is None or p >= cap]
+
     selected = []
-    for target in targets:
-        if not selected or abs(target-selected[-1]) >= zone_volatility*0.25:
+    for target in candidates:
+        if abs(target - entry) >= risk * 1.5 and (not selected or abs(target-selected[-1]) >= zone_volatility * 0.25):
             selected.append(target)
         if len(selected) == 3:
             break
-    # A plan without an observed target is incomplete and must not be emitted.
+    # If liquidity lies beyond the opposing zone, use a conservative pre-zone target only
+    # when the resulting reward/risk still meets the minimum threshold.
+    if not selected and cap is not None and abs(cap - entry) >= risk * 1.5:
+        selected = [cap]
     if not selected:
         return None
-    rr = abs(selected[0]-entry)/risk
+
     current_inside = low <= current <= high
-    if current_inside:
-        activation = "Price is inside the zone; wait for a rejection candle and a confirmed lower-timeframe structure shift."
-    else:
-        activation = "Wait for price to enter the zone, then require a rejection candle and a confirmed lower-timeframe structure shift."
-    status = "DATA_REVIEW_REQUIRED" if data_blocked else (
-        "WAITING_FOR_ZONE" if not current_inside else "WAITING_FOR_CONFIRMATION"
-    )
+    activation = ("Price is inside the zone; wait for a rejection candle and confirmed lower-timeframe structure shift."
+                  if current_inside else
+                  "Wait for price to enter the narrow zone, then require a rejection candle and confirmed lower-timeframe structure shift.")
     return {
-        "side": side,
-        "entry_zone": {"low": low, "high": high},
-        "entry_reference": entry,
-        "distance_from_current": round(abs(current-entry), 5),
-        "distance_atr": zone["distance_atr"],
-        "current_price_inside_zone": current_inside,
+        "side": side, "entry_zone": {"low": low, "high": high},
+        "entry_reference": entry, "distance_from_current": round(abs(current-entry), 5),
+        "distance_atr": zone["distance_atr"], "current_price_inside_zone": current_inside,
         "stop_loss": round(stop, 5),
         "targets": [{"name": f"TP{i+1}", "price": round(p, 5)} for i, p in enumerate(selected)],
-        "first_target_rr": round(rr, 2) if rr is not None else None,
-        "target_method": "OBSERVED_LIQUIDITY",
-        "target_count": len(selected),
-        "zone_score": zone["score"], "zone_strength": zone["strength_label"],
-        "zone_timeframes": zone["timeframes"],
-        "confirmation_required": activation,
-        "setup_status": status,
+        "first_target_rr": round(abs(selected[0]-entry)/risk, 2),
+        "target_method": "OBSERVED_LIQUIDITY_CAPPED_BEFORE_OPPOSING_ZONE",
+        "opposing_zone_barrier": ({"low": barrier["low"], "high": barrier["high"]} if barrier else None),
+        "target_count": len(selected), "zone_score": zone["score"],
+        "zone_strength": zone["strength_label"], "zone_timeframes": zone["timeframes"],
+        "confirmation_required": activation, "setup_status": "WAITING_FOR_ZONE" if not current_inside else "WAITING_FOR_CONFIRMATION",
         "trade_allowed_now": False,
         "invalidation": "Cancel if price closes beyond the stop boundary or the zone is decisively broken.",
         "structure_context": "Check lower-timeframe BOS/CHoCH before activation."
@@ -763,9 +819,11 @@ def build_price_path(current: float, volatility: float, structure: dict,
     }
 
 
-def analyze_market(frames: Dict[str, List[dict]], quality: dict) -> dict:
+def analyze_market(frames: Dict[str, List[dict]], quality: dict, live_quote: dict) -> dict:
     primary = frames["15min"]
-    current = primary[-1]["close"]
+    last_candle_close = primary[-1]["close"]
+    live_price_valid = bool(live_quote.get("valid"))
+    current = float(live_quote["price"]) if live_price_valid else last_candle_close
     per_tf, votes = {}, {"BULLISH": 0, "BEARISH": 0, "RANGE": 0}
     all_zones = {"BUY": [], "SELL": []}
     for tf in TIMEFRAMES:
@@ -802,22 +860,27 @@ def analyze_market(frames: Dict[str, List[dict]], quality: dict) -> dict:
 
     # Pick the nearest qualifying zone for the plan; do not let a distant
     # high-scoring zone hide a nearer valid opportunity.
-    buy_plan_zone = min((z for z in buy_zones if z["score"] >= 60),
-                        key=lambda z: z["distance"], default=None)
-    sell_plan_zone = min((z for z in sell_zones if z["score"] >= 60),
-                         key=lambda z: z["distance"], default=None)
-    blocked = quality["analysis_blocked"]
-    buy_plan = make_trade_plan(buy_plan_zone, "BUY", current, current_vol, liquidity, blocked)
-    sell_plan = make_trade_plan(sell_plan_zone, "SELL", current, current_vol, liquidity, blocked)
+    max_entry_width = max(current_vol * 1.5, current * 0.0008)
+    def actionable(z):
+        return z["score"] >= 65 and (z["high"] - z["low"]) <= max_entry_width and any(tf in ("15min", "1h") for tf in z["timeframes"])
+    buy_plan_zone = min((z for z in buy_zones if actionable(z)), key=lambda z: z["distance"], default=None)
+    sell_plan_zone = min((z for z in sell_zones if actionable(z)), key=lambda z: z["distance"], default=None)
+    blocked = quality["analysis_blocked"] or not live_price_valid
+    buy_plan = make_trade_plan(buy_plan_zone, "BUY", current, current_vol, liquidity, blocked, sell_zones)
+    sell_plan = make_trade_plan(sell_plan_zone, "SELL", current, current_vol, liquidity, blocked, buy_zones)
 
     path = build_price_path(current, current_vol, per_tf["15min"]["structure"],
                             liquidity, buy_zones, sell_zones)
-    decision = "DATA_INVALID" if blocked else (
+    decision = "DATA_INVALID" if quality["analysis_blocked"] else (
+        "NO_TRADE_LIVE_PRICE_UNAVAILABLE" if not live_price_valid else
         "WAIT_FOR_CONFIRMATION" if bias == "NEUTRAL" else "WAIT_FOR_SETUP"
     )
     return {
         "engine": ENGINE_NAME, "version": VERSION, "symbol": SYMBOL,
         "decision": decision, "current_price": round(current, 5),
+        "price_source": "LIVE_QUOTE" if live_price_valid else "LAST_15MIN_CANDLE_CLOSE_NOT_LIVE",
+        "last_15min_candle_close": round(last_candle_close, 5),
+        "live_quote": live_quote,
         "market": {
             "directional_bias": bias, "timeframe_votes": votes,
             "timeframe_alignment_score": aligned_score,
@@ -878,11 +941,12 @@ def build_telegram_report(result: dict) -> str:
     path = result["price_path"]
     lines = [
         f"📊 {ENGINE_NAME} | {SYMBOL} | v{VERSION}",
-        f"السعر المرجعي: {fmt_price(result['current_price'])}",
+        f"السعر: {fmt_price(result['current_price'])} | المصدر: {result.get('price_source', 'غير معروف')}",
         f"القرار: {result['decision']}",
         f"الاتجاه العام: {market['directional_bias']} | توافق الفريمات: {market['timeframe_alignment_score']}",
         f"تصويت الفريمات: {market['timeframe_votes']}",
-        f"سلامة البيانات: {quality['status']}"
+        f"سلامة البيانات: {quality['status']}",
+        f"تحديث السعر: {result.get('live_quote', {}).get('age_seconds')} ثانية" if result.get("live_quote", {}).get("valid") else "⛔ لا يوجد سعر لحظي صالح؛ ممنوع إصدار خطط دخول."
     ]
     if quality["blockers"]:
         lines.append("⛔ موانع التحليل: " + "؛ ".join(quality["blockers"][:8]))
@@ -933,6 +997,7 @@ def health():
         "max_candles_per_timeframe": MAX_CANDLES,
         "minimum_complete_candles": MIN_COMPLETE_CANDLES,
         "preferred_complete_candles": PREFERRED_COMPLETE_CANDLES,
+        "live_quote_required": True, "live_quote_max_age_seconds": LIVE_QUOTE_MAX_AGE_SECONDS,
         "configured_source_timezone": os.getenv("SOURCE_TIMEZONE") or None,
         "source_timezones_by_timeframe": {
             tf: os.getenv("SOURCE_TIMEZONE_" + tf.upper()) or DEFAULT_SOURCE_TIMEZONES.get(tf)
@@ -950,6 +1015,7 @@ def analyze():
         if payload is None:
             return jsonify({"error": "invalid_or_missing_json_body"}), 400
         frames, errors, notes, diagnostics = normalize_payload(payload)
+        live_quote = extract_live_quote(payload)
         quality = data_quality_report(frames, errors, notes, diagnostics)
         if quality["analysis_blocked"]:
             response = {
@@ -959,7 +1025,7 @@ def analyze():
                 "message": "Analysis stopped because the candle data failed validation. Correct the source timestamps/data and resend; the engine will not shift timestamps or invent candles."
             }
             return jsonify(response), 422
-        result = analyze_market(frames, quality)
+        result = analyze_market(frames, quality, live_quote)
         result["telegram_report"] = build_telegram_report(result)
         return jsonify(result), 200
     except Exception as exc:
