@@ -12,7 +12,7 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 __all__ = ["app"]
 
-VERSION = "7.6.0"
+VERSION = "7.7.0"
 ENGINE_NAME = "Gold Analysis Engine"
 SYMBOL = "XAU/USD"
 TIMEFRAMES = ["15min", "1h", "4h", "1day", "1week", "1month"]
@@ -1362,7 +1362,9 @@ def build_screening_summary(current: float, volatility: float,
 def build_research_candidate(zone: dict, side: str, current: float,
                              volatility: float, liquidity: dict,
                              primary_candles: List[dict], opposing_zones: List[dict],
-                             directional_bias: str) -> dict:
+                             directional_bias: str,
+                             timeframe_analysis: Optional[dict] = None,
+                             data_blocked: bool = False) -> dict:
     """Build a transparent paper-research scenario without pretending it is executable."""
     low, high = float(zone["low"]), float(zone["high"])
     entry = (low + high) / 2.0
@@ -1384,6 +1386,60 @@ def build_research_candidate(zone: dict, side: str, current: float,
     confirmation_score = float(evidence.get("confirmation_score", 0))
     alignment = directional_bias == ("BULLISH" if side == "BUY" else "BEARISH")
     freshness = max(0.0, 1.0 - float(zone.get("age_candles", 999)) / 180.0)
+    tf_analysis = timeframe_analysis or {}
+    expected_direction = "BULLISH" if side == "BUY" else "BEARISH"
+    tf_rows = {}
+    aligned_tfs = 0
+    contradictory_tfs = 0
+    assessed_tfs = 0
+    for tf in TIMEFRAMES:
+        item = tf_analysis.get(tf)
+        if not item:
+            tf_rows[tf] = {"available": False, "status": "DATA_UNAVAILABLE"}
+            continue
+        structure = item.get("structure", {})
+        direction = item.get("direction", structure.get("direction"))
+        contradiction = bool(item.get("structure_consistency", {}).get("contradiction"))
+        assessed_tfs += 1
+        if direction == expected_direction and not contradiction:
+            aligned_tfs += 1
+        if contradiction:
+            contradictory_tfs += 1
+        tf_rows[tf] = {
+            "available": True,
+            "direction": direction,
+            "bos": structure.get("bos"),
+            "choch": structure.get("choch"),
+            "contradiction": contradiction,
+            "latest_close": item.get("latest_close"),
+            "swing_high": (structure.get("swing_high") or {}).get("price"),
+            "swing_low": (structure.get("swing_low") or {}).get("price")
+        }
+    tf_alignment_ratio = round(aligned_tfs / assessed_tfs, 3) if assessed_tfs else 0.0
+    checks = evidence.get("checks", {})
+    check_labels = {
+        "zone_touched_recently": "لمس المنطقة حديثًا",
+        "rejection_candle": "شمعة رفض",
+        "directional_displacement": "إزاحة سعرية في اتجاه الإعداد",
+        "fresh_bos": "كسر هيكلي BOS حديث",
+        "fresh_choch": "تغير سلوك CHoCH حديث",
+        "liquidity_sweep": "سحب سيولة مؤكد",
+        "higher_timeframe_alignment": "توافق الاتجاه الأعلى"
+    }
+    met_conditions = [label for key, label in check_labels.items() if checks.get(key)]
+    missing_conditions = [label for key, label in check_labels.items() if not checks.get(key)]
+    opposite_bias = "BEARISH" if side == "BUY" else "BULLISH"
+    execution_checks = {
+        "zone_score_threshold": float(zone.get("score", 0)) >= MIN_PLAN_ZONE_SCORE,
+        "execution_distance_threshold": abs(current-entry) / volatility <= MAX_PLAN_DISTANCE_ATR,
+        "valid_zone_geometry": high > low and (high-low) <= volatility * 2.2,
+        "countertrend_reversal_rule": not (directional_bias == opposite_bias and not evidence.get("reversal_confirmed")),
+        "valid_observed_target": target_source != "MODELLED_R_MULTIPLE_NOT_OBSERVED_LIQUIDITY",
+        "minimum_target_rr": bool(risk > 0 and abs(targets[0]-entry) / risk >= 1.35),
+        "confirmation_complete_for_activation": bool(evidence.get("confirmed")),
+        "data_integrity": not data_blocked
+    }
+    execution_missing = [key for key, passed in execution_checks.items() if not passed]
     quality_score = (0.45 * float(zone.get("score", 0)) +
                      8.0 * min(tf_count, 4) +
                      25.0 * confirmation_score +
@@ -1408,7 +1464,19 @@ def build_research_candidate(zone: dict, side: str, current: float,
         "research_quality_score": quality_score,
         "research_grade": "STRONG_CONFLUENCE_WATCH" if strong else "WATCH_ONLY_EVIDENCE_INCOMPLETE",
         "zone_timeframes": zone.get("timeframes", []),
+        "timeframe_analysis": tf_rows,
+        "timeframe_alignment": {
+            "expected_direction": expected_direction,
+            "aligned_timeframes": aligned_tfs,
+            "assessed_timeframes": assessed_tfs,
+            "alignment_ratio": tf_alignment_ratio,
+            "contradictory_timeframes": contradictory_tfs
+        },
         "confirmation": evidence,
+        "conditions_met": met_conditions,
+        "conditions_missing": missing_conditions,
+        "execution_eligibility_checks": execution_checks,
+        "execution_blockers": execution_missing,
         "directional_alignment": alignment,
         "zone_age_candles": zone.get("age_candles"),
         "zone_tests": zone.get("tests"),
@@ -1458,7 +1526,9 @@ def build_pivot_reference_zones(candles: List[dict], current: float,
 def build_candidate_map(current: float, volatility: float,
                         buy_zones: List[dict], sell_zones: List[dict],
                         liquidity: dict, primary_candles: List[dict],
-                        directional_bias: str) -> dict:
+                        directional_bias: str,
+                        timeframe_analysis: Optional[dict] = None,
+                        data_blocked: bool = False) -> dict:
     buy_source = list(buy_zones)
     sell_source = list(sell_zones)
     # Keep the output useful when no formal demand/supply zone was extracted:
@@ -1468,30 +1538,37 @@ def build_candidate_map(current: float, volatility: float,
     if not sell_source:
         sell_source = build_pivot_reference_zones(primary_candles, current, volatility, "SELL")
     buy = [build_research_candidate(z, "BUY", current, volatility, liquidity,
-                                   primary_candles, sell_source, directional_bias)
+                                   primary_candles, sell_source, directional_bias,
+                                   timeframe_analysis, data_blocked)
            for z in buy_source]
     sell = [build_research_candidate(z, "SELL", current, volatility, liquidity,
-                                    primary_candles, buy_source, directional_bias)
+                                    primary_candles, buy_source, directional_bias,
+                                    timeframe_analysis, data_blocked)
             for z in sell_source]
     buy = [x for x in buy if x]
     sell = [x for x in sell if x]
-    rank = lambda x: (x.get("research_quality_score", 0),
-                      len(x.get("zone_timeframes", [])),
-                      x.get("confirmation", {}).get("confirmation_score", 0),
-                      -x.get("distance_atr", 999))
+    rank = lambda x: (
+        bool(x.get("confirmation", {}).get("confirmed")),
+        x.get("research_quality_score", 0),
+        x.get("timeframe_alignment", {}).get("alignment_ratio", 0),
+        len(x.get("zone_timeframes", [])),
+        x.get("confirmation", {}).get("confirmation_score", 0),
+        -x.get("distance_atr", 999)
+    )
     buy.sort(key=rank, reverse=True)
     sell.sort(key=rank, reverse=True)
     def split(items):
         return {
             "best_research_candidate": items[0] if items else None,
             "nearest_candidate": min(items, key=lambda x: x["distance_atr"]) if items else None,
-            "ranked_candidates": items[:10],
+            "ranked_candidates": items,
             "candidate_count": len(items)
         }
     return {
         "mode": "PAPER_RESEARCH_ONLY",
         "buy": split(buy), "sell": split(sell),
-        "selection_policy": "Rank all detected zones by evidence, multi-timeframe confluence, confirmation and distance. Distance alone never upgrades a weak zone.",
+        "selection_policy": "All detected valid-width zones are retained in the research watchlist regardless of execution-distance or missing confirmation; ranked by confirmation, technical evidence, timeframe alignment, confluence and distance. This ranking is not a win probability.",
+        "watchlist_policy": "A missing condition is reported, not used to delete the candidate. Execution eligibility remains separately filtered.",
         "no_candidate_reason": {
             "buy": "لم تُستخرج منطقة طلب أو قاع محوري مؤكد أسفل السعر من بيانات 15 دقيقة." if not buy else None,
             "sell": "لم تُستخرج منطقة عرض أو قمة محورية مؤكدة أعلى السعر من بيانات 15 دقيقة." if not sell else None
@@ -1594,6 +1671,10 @@ def analyze_market(frames: Dict[str, List[dict]], quality: dict,
             zone["score"] = round(min(99.0, zone["score"] + min(8, max(0, tf_count-1)*2)), 1)
             zone["strength_label"] = "STRONG" if zone["score"] >= 78 else "MODERATE" if zone["score"] >= 65 else "WEAK"
 
+    # Keep every detected confluence zone for the watchlist before execution-quality filters.
+    # Distance and zone-width failures are displayed as blockers, not silently discarded.
+    buy_watch_zones = list(buy_zones)
+    sell_watch_zones = list(sell_zones)
     buy_zones = [z for z in buy_zones if z.get("width_atr") is not None and z["width_atr"] <= 2.2]
     sell_zones = [z for z in sell_zones if z.get("width_atr") is not None and z["width_atr"] <= 2.2]
     rejected_extreme_zones = {
@@ -1676,8 +1757,9 @@ def analyze_market(frames: Dict[str, List[dict]], quality: dict,
             "all_sell_zones": sorted(sell_zones, key=lambda z: (-z["score"], z["distance"]))[:30]
         },
         "scenario_ladder": build_scenario_ladder(current, liquidity, buy_zones, sell_zones, per_tf, path),
-        "research_candidate_map": build_candidate_map(current, current_vol, buy_zones, sell_zones,
-                                                       liquidity, primary, bias),
+        "research_candidate_map": build_candidate_map(
+            current, current_vol, buy_watch_zones, sell_watch_zones,
+            liquidity, primary, bias, per_tf, quality["analysis_blocked"]),
         "structure_conflicts": [tf for tf, item in per_tf.items()
                                 if item.get("structure_consistency", {}).get("contradiction")],
         "screening_summary": {**build_screening_summary(current, current_vol, buy_zones, sell_zones),
@@ -1843,8 +1925,9 @@ def build_telegram_report(result: dict) -> str:
         f"- مناطق شراء: {screening.get('buy_zone_count', 0)} | مناطق بيع: {screening.get('sell_zone_count', 0)}",
         f"- مناطق ضمن 2 ATR: {screening.get('zones_within_2_atr', 0)} | ضمن 4 ATR: {screening.get('zones_within_4_atr', 0)}",
         f"- مناطق حققت حد التقييم: {screening.get('zones_meeting_score_threshold', 0)}",
-        f"- مناطق حققت شرطي المسافة والتقييم الحاليين: {screening.get('zones_meeting_current_plan_distance_and_score', 0)}",
-        f"- أقرب شراء: {screening.get('nearest_buy_zone_distance_atr')} ATR | أقرب بيع: {screening.get('nearest_sell_zone_distance_atr')} ATR"
+        f"- مناطق حققت شرطي المسافة والتقييم لخطة التنفيذ: {screening.get('zones_meeting_current_plan_distance_and_score', 0)}",
+        f"- أقرب شراء: {screening.get('nearest_buy_zone_distance_atr')} ATR | أقرب بيع: {screening.get('nearest_sell_zone_distance_atr')} ATR",
+        "- ملاحظة: قائمة المراقبة تحتفظ بالمناطق المرصودة حتى لو كانت بعيدة أو ناقصة التأكيد؛ شروط التنفيذ منفصلة."
     ])
 
     lines.extend(["", "📍 أقرب مناطق الانعكاس"])
@@ -1861,29 +1944,50 @@ def build_telegram_report(result: dict) -> str:
         lines.append(f"مناطق قوية بعيدة (للسياق فقط): {len(group['strong_distant'])}")
 
     research_map = result.get("research_candidate_map", {})
-    lines.extend(["", "🧪 خريطة المرشحين البحثية (للاختبار الورقي فقط)"])
+    lines.extend(["", "🧪 قائمة مناطق الدخول للمراقبة — مرتبة من الأقوى للأضعف (لا تُحذف لنقص التأكيد)"])
     for side_key, side_label in (("buy", "شراء"), ("sell", "بيع")):
         side_data = research_map.get(side_key, {})
         lines.append(f"{side_label}: عدد المناطق/المراجع المرصودة {side_data.get('candidate_count', 0)}")
         nearest = side_data.get("nearest_candidate")
         if nearest:
             lines.append(
-                f"- الأقرب للسعر: {fmt_price(nearest.get('entry_reference'))}"
+                f"- الأقرب للسعر فقط (ليس بالضرورة الأقوى): {fmt_price(nearest.get('entry_reference'))}"
                 f" | البعد {nearest.get('distance_atr')} ATR"
                 f" | الأساس: {nearest.get('reference_basis', 'DEMAND_SUPPLY_ZONE')}"
             )
-        for candidate in side_data.get("ranked_candidates", [])[:5]:
+        for candidate_rank, candidate in enumerate(side_data.get("ranked_candidates", []), 1):
             lines.append(
-                f"- {candidate.get('entry_label')} {fmt_price(candidate.get('entry_zone', {}).get('low'))}–"
-                f"{fmt_price(candidate.get('entry_zone', {}).get('high'))} | مرجع {fmt_price(candidate.get('entry_reference'))}"
-                f" | SL مرجعي {fmt_price(candidate.get('stop_loss_reference'))}"
-                f" | الجودة البحثية {candidate.get('research_quality_score')}/100"
+                f"#{candidate_rank} {candidate.get('entry_label')} {fmt_price(candidate.get('entry_zone', {}).get('low'))}–"
+                f"{fmt_price(candidate.get('entry_zone', {}).get('high'))} | مرجع المنطقة {fmt_price(candidate.get('entry_reference'))}"
+                f" | قوة المنطقة {candidate.get('zone_score')}/100"
+                f" | التقييم البحثي المركب {candidate.get('research_quality_score')}/100"
                 f" | البعد {candidate.get('distance_atr')} ATR"
-                f" | الفريمات {','.join(candidate.get('zone_timeframes', [])) or 'غير محدد'}"
+                f" | فريمات المنطقة {','.join(candidate.get('zone_timeframes', [])) or 'غير محدد'}"
                 f" | {candidate.get('research_grade')}"
             )
+            tf_align = candidate.get("timeframe_alignment", {})
+            lines.append(
+                f"  توافق الفريمات: {tf_align.get('aligned_timeframes', 0)}/{tf_align.get('assessed_timeframes', 0)}"
+                f" | تعارضات هيكلية: {tf_align.get('contradictory_timeframes', 0)}"
+            )
+            checks = candidate.get("confirmation", {}).get("checks", {})
+            check_ar = {
+                "zone_touched_recently": "لمس",
+                "rejection_candle": "رفض",
+                "directional_displacement": "إزاحة",
+                "fresh_bos": "BOS",
+                "fresh_choch": "CHoCH",
+                "liquidity_sweep": "سحب سيولة",
+                "higher_timeframe_alignment": "توافق HTF"
+            }
+            met = [label for key, label in check_ar.items() if checks.get(key)]
+            missing = [label for key, label in check_ar.items() if not checks.get(key)]
+            lines.append("  المتحقق: " + ("، ".join(met) if met else "لا يوجد بعد"))
+            lines.append("  غير المتحقق: " + ("، ".join(missing) if missing else "كل شروط التأكيد الأساسية"))
+            blockers = candidate.get("execution_blockers", [])
+            lines.append("  الشروط/الموانع المتبقية قبل التفعيل: " + ("، ".join(blockers) if blockers else "لا توجد موانع مسجلة"))
             targets_text = "، ".join(fmt_price(t.get("price")) for t in candidate.get("targets", []))
-            lines.append(f"  أهداف افتراضية: {targets_text} | المصدر: {candidate.get('target_method')}")
+            lines.append(f"  مستويات بحث افتراضية فقط: {targets_text} | المصدر: {candidate.get('target_method')}")
         if not side_data.get("candidate_count"):
             lines.append("- " + str(research_map.get("no_candidate_reason", {}).get(side_key) or "لا توجد مناطق مرصودة."))
     conflicts = result.get("structure_conflicts", [])
@@ -1891,7 +1995,7 @@ def build_telegram_report(result: dict) -> str:
         lines.append("⚠️ تعارض بنية الفريمات: " + ", ".join(conflicts))
     lines.append("تنبيه: هذه مستويات بحث واختبار افتراضي، وليست أوامر تداول أو ضمانات.")
 
-    lines.extend(["", "🎯 أفضل إعداد تحليلي واحد"])
+    lines.extend(["", "🎯 خطة التنفيذ التحليلية الحالية (منفصلة عن قائمة المراقبة)"])
     best = result.get("entry_analysis", {}).get("best_plan")
     lines.extend(format_plan("أفضل مرشح", best))
     bull = path["bullish_scenario"]
