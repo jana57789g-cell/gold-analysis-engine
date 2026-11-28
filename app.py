@@ -12,7 +12,7 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 __all__ = ["app"]
 
-VERSION = "7.7.0"
+VERSION = "7.8.0"
 ENGINE_NAME = "Gold Analysis Engine"
 SYMBOL = "XAU/USD"
 TIMEFRAMES = ["15min", "1h", "4h", "1day", "1week", "1month"]
@@ -34,17 +34,22 @@ CANDLE_TIMESTAMP_TYPE = os.getenv("CANDLE_TIMESTAMP_TYPE", "open").strip().lower
 if CANDLE_TIMESTAMP_TYPE not in {"open", "close"}:
     raise ValueError("CANDLE_TIMESTAMP_TYPE must be 'open' or 'close'")
 
-# A candidate must be reasonably close to price and have a meaningful zone score.
-# These are analytical filters, not calibrated probabilities or execution advice.
+# Discovery and execution are deliberately separate.
+# These limits apply only to the legacy near-price execution-plan selector;
+# they must never suppress discovered opportunities from the BUY/SELL lists.
 MAX_PLAN_DISTANCE_ATR = float(os.getenv("MAX_PLAN_DISTANCE_ATR", "2.0"))
 MIN_PLAN_ZONE_SCORE = float(os.getenv("MIN_PLAN_ZONE_SCORE", "70"))
 MAX_MONITOR_ZONE_DISTANCE_ATR = float(os.getenv("MAX_MONITOR_ZONE_DISTANCE_ATR", "30"))
+MIN_STRONG_ENTRY_STRENGTH = float(os.getenv("MIN_STRONG_ENTRY_STRENGTH", "70"))
+MIN_ROCKET_ENTRY_STRENGTH = float(os.getenv("MIN_ROCKET_ENTRY_STRENGTH", "82"))
 if MAX_PLAN_DISTANCE_ATR <= 0:
     raise ValueError("MAX_PLAN_DISTANCE_ATR must be positive")
 if not 0 <= MIN_PLAN_ZONE_SCORE <= 100:
     raise ValueError("MIN_PLAN_ZONE_SCORE must be between 0 and 100")
 if MAX_MONITOR_ZONE_DISTANCE_ATR <= MAX_PLAN_DISTANCE_ATR:
     raise ValueError("MAX_MONITOR_ZONE_DISTANCE_ATR must exceed MAX_PLAN_DISTANCE_ATR")
+if not 0 <= MIN_STRONG_ENTRY_STRENGTH <= 100 or not 0 <= MIN_ROCKET_ENTRY_STRENGTH <= 100:
+    raise ValueError("entry strength thresholds must be between 0 and 100")
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("gold_analysis_engine")
@@ -944,7 +949,8 @@ def make_trade_plan(zone: Optional[dict], side: str, current: float,
     if distance_atr > MAX_PLAN_DISTANCE_ATR:
         return None
     low, high, entry = zone["low"], zone["high"], zone["mid"]
-    if high <= low or (high - low) > volatility * 2.2:
+    source_atr = float(zone.get("source_atr") or volatility)
+    if high <= low or source_atr <= 0 or (high - low) > source_atr * 2.2:
         return None
 
     evidence = confirmation_evidence(primary_candles, zone, side, volatility, liquidity, directional_bias)
@@ -981,9 +987,10 @@ def make_trade_plan(zone: Optional[dict], side: str, current: float,
     return {
         "side": side,
         "setup_type": evidence["setup_type"],
-        "entry_label": "المنقطع",
+        "entry_label": "منطقة الدخول المرجعية",
         "entry_zone": {"low": low, "high": high},
         "entry_reference": entry,
+        "entry_reference_method": "ZONE_MIDPOINT_REFERENCE_NOT_CONFIRMED_EXECUTION_TICK",
         "distance_from_current": round(abs(current-entry), 5),
         "distance_atr": round(distance_atr, 2),
         "current_price_inside_zone": current_inside,
@@ -1432,7 +1439,8 @@ def build_research_candidate(zone: dict, side: str, current: float,
     execution_checks = {
         "zone_score_threshold": float(zone.get("score", 0)) >= MIN_PLAN_ZONE_SCORE,
         "execution_distance_threshold": abs(current-entry) / volatility <= MAX_PLAN_DISTANCE_ATR,
-        "valid_zone_geometry": high > low and (high-low) <= volatility * 2.2,
+        "valid_zone_geometry": high > low and float(zone.get("source_atr") or volatility) > 0
+                              and (high-low) <= float(zone.get("source_atr") or volatility) * 2.2,
         "countertrend_reversal_rule": not (directional_bias == opposite_bias and not evidence.get("reversal_confirmed")),
         "valid_observed_target": target_source != "MODELLED_R_MULTIPLE_NOT_OBSERVED_LIQUIDITY",
         "minimum_target_rr": bool(risk > 0 and abs(targets[0]-entry) / risk >= 1.35),
@@ -1446,13 +1454,46 @@ def build_research_candidate(zone: dict, side: str, current: float,
                      7.0 * freshness +
                      (5.0 if alignment else 0.0))
     quality_score = round(min(100.0, quality_score), 1)
-    # "Strong" requires confluence and real confirmation; score alone is insufficient.
-    strong = quality_score >= 75 and tf_count >= 2 and confirmation_score >= 0.40
+    impulse = max(0.0, min(1.0, float(zone.get("impulse_strength", 0) or 0)))
+    reaction = max(0.0, min(1.0, float(zone.get("reaction_strength", 0) or 0)))
+    # Setup strength deliberately excludes live confirmation so a strong distant
+    # level is not demoted merely because price has not reached it yet.
+    setup_strength = round(min(100.0, max(0.0,
+        0.40 * float(zone.get("score", 0)) +
+        20.0 * tf_alignment_ratio +
+        10.0 * freshness +
+        10.0 * impulse +
+        5.0 * reaction +
+        (10.0 if alignment else 0.0) +
+        5.0 * min(tf_count / 3.0, 1.0)
+    )), 1)
+    strong = (setup_strength >= MIN_STRONG_ENTRY_STRENGTH and
+              float(zone.get("score", 0)) >= 65 and
+              zone.get("reference_basis") != "CONFIRMED_15MIN_SWING_REFERENCE_NOT_ORDER_BLOCK")
+    rocket = (setup_strength >= MIN_ROCKET_ENTRY_STRENGTH and
+              float(zone.get("score", 0)) >= 78 and tf_count >= 2 and
+              confirmation_score >= 0.55 and
+              bool(checks.get("liquidity_sweep")) and
+              bool(checks.get("directional_displacement")) and
+              bool(checks.get("fresh_bos") or checks.get("fresh_choch")))
+    if data_blocked:
+        execution_status = "DATA_REVIEW_REQUIRED"
+    elif not execution_checks["execution_distance_threshold"]:
+        execution_status = "WAITING_FOR_PRICE"
+    elif not execution_checks["zone_score_threshold"] or not execution_checks["valid_zone_geometry"]:
+        execution_status = "NOT_ELIGIBLE_UNDER_CURRENT_EXECUTION_FILTERS"
+    elif not execution_checks["confirmation_complete_for_activation"]:
+        execution_status = "WAITING_FOR_CONFIRMATION"
+    elif execution_missing:
+        execution_status = "CONDITIONAL_REVIEW_REQUIRED"
+    else:
+        execution_status = "CONDITIONALLY_CONFIRMED_NOT_AUTO_EXECUTABLE"
     return {
         "side": side,
-        "entry_label": "المنقطع",
+        "entry_label": "منطقة الدخول المرجعية",
         "entry_zone": {"low": round(low, 5), "high": round(high, 5)},
         "entry_reference": round(entry, 5),
+        "entry_reference_method": "ZONE_MIDPOINT_REFERENCE_NOT_CONFIRMED_EXECUTION_TICK",
         "distance_from_current": round(abs(current-entry), 5),
         "distance_atr": round(abs(current-entry)/volatility, 2),
         "stop_loss_reference": round(stop, 5),
@@ -1462,6 +1503,10 @@ def build_research_candidate(zone: dict, side: str, current: float,
         "first_target_rr": round(abs(targets[0]-entry)/risk, 2) if risk else None,
         "zone_score": zone.get("score"),
         "research_quality_score": quality_score,
+        "setup_strength_score": setup_strength,
+        "strength_grade": "STRONG" if strong else "MODERATE" if setup_strength >= 55 else "WEAK",
+        "is_strong_entry_candidate": strong,
+        "is_rocket_candidate": rocket,
         "research_grade": "STRONG_CONFLUENCE_WATCH" if strong else "WATCH_ONLY_EVIDENCE_INCOMPLETE",
         "zone_timeframes": zone.get("timeframes", []),
         "timeframe_analysis": tf_rows,
@@ -1477,6 +1522,9 @@ def build_research_candidate(zone: dict, side: str, current: float,
         "conditions_missing": missing_conditions,
         "execution_eligibility_checks": execution_checks,
         "execution_blockers": execution_missing,
+        "execution_status": execution_status,
+        "execution_ready": not execution_missing,
+        "discovery_status": "STRONG_ENTRY_CANDIDATE" if strong else "RESEARCH_CANDIDATE",
         "directional_alignment": alignment,
         "zone_age_candles": zone.get("age_candles"),
         "zone_tests": zone.get("tests"),
@@ -1548,27 +1596,35 @@ def build_candidate_map(current: float, volatility: float,
     buy = [x for x in buy if x]
     sell = [x for x in sell if x]
     rank = lambda x: (
-        bool(x.get("confirmation", {}).get("confirmed")),
-        x.get("research_quality_score", 0),
+        x.get("setup_strength_score", 0),
+        x.get("zone_score", 0),
         x.get("timeframe_alignment", {}).get("alignment_ratio", 0),
-        len(x.get("zone_timeframes", [])),
         x.get("confirmation", {}).get("confirmation_score", 0),
+        bool(x.get("confirmation", {}).get("confirmed")),
         -x.get("distance_atr", 999)
     )
     buy.sort(key=rank, reverse=True)
     sell.sort(key=rank, reverse=True)
     def split(items):
+        rockets = [x for x in items if x.get("is_rocket_candidate")]
+        strong = [x for x in items if x.get("is_strong_entry_candidate")]
         return {
             "best_research_candidate": items[0] if items else None,
             "nearest_candidate": min(items, key=lambda x: x["distance_atr"]) if items else None,
             "ranked_candidates": items,
-            "candidate_count": len(items)
+            "strong_candidates": strong,
+            "rocket_candidates": rockets,
+            "candidate_count": len(items),
+            "strong_candidate_count": len(strong),
+            "rocket_candidate_count": len(rockets)
         }
     return {
-        "mode": "PAPER_RESEARCH_ONLY",
+        "mode": "DISCOVERY_SEPARATE_FROM_EXECUTION",
         "buy": split(buy), "sell": split(sell),
-        "selection_policy": "All detected valid-width zones are retained in the research watchlist regardless of execution-distance or missing confirmation; ranked by confirmation, technical evidence, timeframe alignment, confluence and distance. This ranking is not a win probability.",
-        "watchlist_policy": "A missing condition is reported, not used to delete the candidate. Execution eligibility remains separately filtered.",
+        "selection_policy": "All detected candidates are retained, including distant levels; ranked primarily by setup strength, then zone quality, timeframe alignment, confirmation and proximity. Confirmation does not delete or demote an otherwise strong distant setup. This ranking is not a win probability.",
+        "watchlist_policy": "Discovery is independent from execution eligibility. Missing conditions and distance/geometry blockers are reported on each candidate; they do not delete the candidate.",
+        "strength_policy": "setup_strength_score measures technical setup characteristics without treating confirmation as a prerequisite; it is not a win probability.",
+        "rocket_policy": "Rocket classification requires a high setup-strength score plus multi-timeframe confluence, high zone quality, liquidity sweep, displacement and fresh BOS/CHoCH confirmation.",
         "no_candidate_reason": {
             "buy": "لم تُستخرج منطقة طلب أو قاع محوري مؤكد أسفل السعر من بيانات 15 دقيقة." if not buy else None,
             "sell": "لم تُستخرج منطقة عرض أو قمة محورية مؤكدة أعلى السعر من بيانات 15 دقيقة." if not sell else None
@@ -1666,7 +1722,10 @@ def analyze_market(frames: Dict[str, List[dict]], quality: dict,
             zone["mid"] = round((zone["low"] + zone["high"]) / 2, 5)
             zone["distance"] = round(abs(current - zone["mid"]), 5)
             zone["distance_atr"] = round(zone["distance"] / current_vol, 2) if current_vol else None
-            zone["width_atr"] = round((zone["high"] - zone["low"]) / current_vol, 2) if current_vol else None
+            zone["width_atr_current"] = round((zone["high"] - zone["low"]) / current_vol, 2) if current_vol else None
+            source_atr = float(zone.get("source_atr") or current_vol or 0)
+            zone["width_atr"] = round((zone["high"] - zone["low"]) / source_atr, 2) if source_atr > 0 else None
+            zone["distance_atr_current"] = zone.get("distance_atr")
             tf_count = len(set(zone.get("timeframes", [])))
             zone["score"] = round(min(99.0, zone["score"] + min(8, max(0, tf_count-1)*2)), 1)
             zone["strength_label"] = "STRONG" if zone["score"] >= 78 else "MODERATE" if zone["score"] >= 65 else "WEAK"
@@ -1675,6 +1734,10 @@ def analyze_market(frames: Dict[str, List[dict]], quality: dict,
     # Distance and zone-width failures are displayed as blockers, not silently discarded.
     buy_watch_zones = list(buy_zones)
     sell_watch_zones = list(sell_zones)
+    rejected_width_zones = {
+        "buy": sum(1 for z in buy_zones if z.get("width_atr") is None or z["width_atr"] > 2.2),
+        "sell": sum(1 for z in sell_zones if z.get("width_atr") is None or z["width_atr"] > 2.2)
+    }
     buy_zones = [z for z in buy_zones if z.get("width_atr") is not None and z["width_atr"] <= 2.2]
     sell_zones = [z for z in sell_zones if z.get("width_atr") is not None and z["width_atr"] <= 2.2]
     rejected_extreme_zones = {
@@ -1716,6 +1779,11 @@ def analyze_market(frames: Dict[str, List[dict]], quality: dict,
     buy_plan = best_plan if best_plan and best_plan["side"] == "BUY" else None
     sell_plan = best_plan if best_plan and best_plan["side"] == "SELL" else None
 
+    discovery_map = build_candidate_map(
+        current, current_vol, buy_watch_zones, sell_watch_zones,
+        liquidity, primary, bias, per_tf, quality["analysis_blocked"])
+    strong_discoveries = (discovery_map["buy"]["strong_candidates"] +
+                          discovery_map["sell"]["strong_candidates"])
     path = build_price_path(current, current_vol, per_tf["15min"]["structure"],
                             liquidity, buy_zones, sell_zones)
     if quality["analysis_blocked"]:
@@ -1724,6 +1792,14 @@ def analyze_market(frames: Dict[str, List[dict]], quality: dict,
         decision = "CONDITIONAL_SETUP_CONFIRMED"
     elif best_plan:
         decision = "WAIT_FOR_CONFIRMATION" if best_plan["setup_status"] != "WAITING_FOR_ZONE" else "WAIT_FOR_SETUP"
+    elif strong_discoveries:
+        statuses = {x.get("execution_status") for x in strong_discoveries}
+        if "WAITING_FOR_PRICE" in statuses:
+            decision = "WAIT_FOR_PRICE"
+        elif "WAITING_FOR_CONFIRMATION" in statuses:
+            decision = "WAIT_FOR_CONFIRMATION"
+        else:
+            decision = "STRONG_OPPORTUNITIES_DETECTED_REVIEW_REQUIRED"
     elif bias == "NEUTRAL":
         decision = "WAIT_FOR_CONFIRMATION"
     else:
@@ -1757,9 +1833,7 @@ def analyze_market(frames: Dict[str, List[dict]], quality: dict,
             "all_sell_zones": sorted(sell_zones, key=lambda z: (-z["score"], z["distance"]))[:30]
         },
         "scenario_ladder": build_scenario_ladder(current, liquidity, buy_zones, sell_zones, per_tf, path),
-        "research_candidate_map": build_candidate_map(
-            current, current_vol, buy_watch_zones, sell_watch_zones,
-            liquidity, primary, bias, per_tf, quality["analysis_blocked"]),
+        "research_candidate_map": discovery_map,
         "structure_conflicts": [tf for tf, item in per_tf.items()
                                 if item.get("structure_consistency", {}).get("contradiction")],
         "screening_summary": {**build_screening_summary(current, current_vol, buy_zones, sell_zones),
@@ -1768,6 +1842,9 @@ def analyze_market(frames: Dict[str, List[dict]], quality: dict,
         "entry_analysis": {
             "buy_plan": buy_plan, "sell_plan": sell_plan,
             "best_plan": best_plan,
+            "buy_opportunities": [],
+            "sell_opportunities": [],
+            "rocket_opportunities": [],
             "candidate_count_before_selection": len(candidate_plans),
             "filters": {
                 "maximum_distance_atr": MAX_PLAN_DISTANCE_ATR,
@@ -1783,6 +1860,18 @@ def analyze_market(frames: Dict[str, List[dict]], quality: dict,
         "data_validation": quality,
         "risk_notice": "Research and paper-testing only. No automatic execution; no setup is guaranteed and no score is a win probability."
     }
+    result["entry_analysis"]["buy_opportunities"] = result["research_candidate_map"]["buy"]["ranked_candidates"]
+    result["entry_analysis"]["sell_opportunities"] = result["research_candidate_map"]["sell"]["ranked_candidates"]
+    result["entry_analysis"]["rocket_opportunities"] = sorted(
+        result["research_candidate_map"]["buy"]["rocket_candidates"] +
+        result["research_candidate_map"]["sell"]["rocket_candidates"],
+        key=lambda x: x.get("setup_strength_score", 0), reverse=True)
+    result["entry_analysis"]["discovery_policy"] = "All detected BUY and SELL candidates are shown independently of the legacy near-price best_plan. Strong and distant opportunities remain visible; execution status is explicit."
+    result["entry_analysis"]["filters"]["one_best_candidate_only"] = False
+    result["entry_analysis"]["filters"]["legacy_best_plan_is_single_summary"] = True
+    result["entry_analysis"]["filters"]["discovery_distance_unlimited"] = True
+    result["entry_analysis"]["filters"]["discovery_rank"] = "setup_strength_score_desc"
+    result["screening_summary"]["rejected_width_zone_count"] = rejected_width_zones
     result["market_scenarios"] = build_market_scenarios(
         current, path, result["scenario_ladder"], per_tf, liquidity, result["data_integrity"])
     return result
@@ -1802,7 +1891,7 @@ def format_plan(name: str, plan: Optional[dict]) -> List[str]:
     zone = plan["entry_zone"]
     lines = [
         f"{name} ({'انعكاس' if plan.get('setup_type') == 'REVERSAL' else 'استمرار' if plan.get('setup_type') == 'CONTINUATION' else 'غير مكتمل'}):",
-        f"- المنقطع: من {fmt_price(zone['low'])} إلى {fmt_price(zone['high'])}",
+        f"- منطقة الدخول المرجعية: من {fmt_price(zone['low'])} إلى {fmt_price(zone['high'])}",
         f"- السعر المرجعي التحليلي: {fmt_price(plan['entry_reference'])}",
         f"- البعد عن السعر المرجعي: {plan['distance_atr']} ATR",
         f"- وقف الإبطال النظري للاختبار: {fmt_price(plan['stop_loss'])}",
@@ -1944,7 +2033,7 @@ def build_telegram_report(result: dict) -> str:
         lines.append(f"مناطق قوية بعيدة (للسياق فقط): {len(group['strong_distant'])}")
 
     research_map = result.get("research_candidate_map", {})
-    lines.extend(["", "🧪 قائمة مناطق الدخول للمراقبة — مرتبة من الأقوى للأضعف (لا تُحذف لنقص التأكيد)"])
+    lines.extend(["", "🧪 قائمة فرص الدخول المكتشفة — مرتبة بقوة الإعداد (الاكتشاف منفصل عن التنفيذ)"])
     for side_key, side_label in (("buy", "شراء"), ("sell", "بيع")):
         side_data = research_map.get(side_key, {})
         lines.append(f"{side_label}: عدد المناطق/المراجع المرصودة {side_data.get('candidate_count', 0)}")
@@ -1960,7 +2049,8 @@ def build_telegram_report(result: dict) -> str:
                 f"#{candidate_rank} {candidate.get('entry_label')} {fmt_price(candidate.get('entry_zone', {}).get('low'))}–"
                 f"{fmt_price(candidate.get('entry_zone', {}).get('high'))} | مرجع المنطقة {fmt_price(candidate.get('entry_reference'))}"
                 f" | قوة المنطقة {candidate.get('zone_score')}/100"
-                f" | التقييم البحثي المركب {candidate.get('research_quality_score')}/100"
+                f" | قوة الإعداد {candidate.get('setup_strength_score')}/100 ({candidate.get('strength_grade')})"
+                f" | التقييم البحثي {candidate.get('research_quality_score')}/100"
                 f" | البعد {candidate.get('distance_atr')} ATR"
                 f" | فريمات المنطقة {','.join(candidate.get('zone_timeframes', [])) or 'غير محدد'}"
                 f" | {candidate.get('research_grade')}"
@@ -1985,11 +2075,25 @@ def build_telegram_report(result: dict) -> str:
             lines.append("  المتحقق: " + ("، ".join(met) if met else "لا يوجد بعد"))
             lines.append("  غير المتحقق: " + ("، ".join(missing) if missing else "كل شروط التأكيد الأساسية"))
             blockers = candidate.get("execution_blockers", [])
+            lines.append("  حالة التنفيذ: " + str(candidate.get("execution_status", "غير محددة")))
             lines.append("  الشروط/الموانع المتبقية قبل التفعيل: " + ("، ".join(blockers) if blockers else "لا توجد موانع مسجلة"))
+            lines.append(f"  وقف مرجعي: {fmt_price(candidate.get('stop_loss_reference'))} | RR أول هدف: {candidate.get('first_target_rr')}")
             targets_text = "، ".join(fmt_price(t.get("price")) for t in candidate.get("targets", []))
-            lines.append(f"  مستويات بحث افتراضية فقط: {targets_text} | المصدر: {candidate.get('target_method')}")
+            lines.append(f"  الأهداف: {targets_text} | المصدر: {candidate.get('target_method')}")
         if not side_data.get("candidate_count"):
             lines.append("- " + str(research_map.get("no_candidate_reason", {}).get(side_key) or "لا توجد مناطق مرصودة."))
+    rocket_entries = result.get("entry_analysis", {}).get("rocket_opportunities", [])
+    lines.extend(["", "🚀 النقاط الصاروخية — تصنيف مستقل"])
+    if rocket_entries:
+        for item in rocket_entries:
+            lines.append(
+                f"- {item.get('side')} | الدخول المرجعي {fmt_price(item.get('entry_reference'))}"
+                f" | قوة الإعداد {item.get('setup_strength_score')}/100"
+                f" | البعد {item.get('distance_atr')} ATR"
+                f" | حالة التنفيذ {item.get('execution_status')}"
+            )
+    else:
+        lines.append("- لا توجد نقطة استوفت شروط التصنيف الصاروخي في البيانات الحالية؛ لا يتم تخفيض الشروط لمجرد ملء القسم.")
     conflicts = result.get("structure_conflicts", [])
     if conflicts:
         lines.append("⚠️ تعارض بنية الفريمات: " + ", ".join(conflicts))
@@ -2047,11 +2151,13 @@ def health():
         "live_quote_max_age_seconds": LIVE_QUOTE_MAX_AGE_SECONDS,
         "max_plan_distance_atr": MAX_PLAN_DISTANCE_ATR,
         "max_monitor_zone_distance_atr": MAX_MONITOR_ZONE_DISTANCE_ATR,
+        "minimum_strong_entry_strength": MIN_STRONG_ENTRY_STRENGTH,
+        "minimum_rocket_entry_strength": MIN_ROCKET_ENTRY_STRENGTH,
         "minimum_plan_zone_score": MIN_PLAN_ZONE_SCORE,
         "timestamp_policy": "epoch or timezone-offset timestamps accepted; naive timestamps use configured per-timeframe IANA timezone",
         "engine_health_monitor": "enabled",
         "partial_timeframe_policy": "15min reference required; other timeframes may be excluded with warnings",
-        "plan_policy": "conditional_analysis_only; no_auto_execution; six_timeframe_scenario_ladder; standalone_market_scenarios"
+        "plan_policy": "discovery_separate_from_execution; all_buy_sell_candidates; strength_first_ranking; conditional_analysis_only; no_auto_execution; standalone_market_scenarios"
     })
 
 
